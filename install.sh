@@ -25,19 +25,35 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+read_from_tty() {
+  local prompt="$1"
+  local silent="${2:-0}"
+  local value
+
+  [ -r /dev/tty ] || die "interactive input requires a TTY. Run this script from a terminal."
+
+  if [ "$silent" = "1" ]; then
+    read -r -s -p "$prompt" value </dev/tty
+    printf '\n' >/dev/tty
+  else
+    read -r -p "$prompt" value </dev/tty
+  fi
+
+  printf '%s' "$value"
+}
+
 prompt_default() {
   local prompt="$1"
   local default="$2"
   local value
-  read -r -p "${prompt} [${default}]: " value
+  value="$(read_from_tty "${prompt} [${default}]: ")"
   printf '%s' "${value:-$default}"
 }
 
 prompt_secret() {
   local prompt="$1"
   local value
-  read -r -s -p "${prompt}: " value
-  printf '\n' >&2
+  value="$(read_from_tty "${prompt}: " 1)"
   printf '%s' "$value"
 }
 
@@ -49,7 +65,7 @@ confirm() {
   if [ "$default" = "N" ]; then
     suffix="[y/N]"
   fi
-  read -r -p "${prompt} ${suffix}: " answer
+  answer="$(read_from_tty "${prompt} ${suffix}: ")"
   answer="${answer:-$default}"
   case "$answer" in
     y|Y|yes|YES) return 0 ;;
