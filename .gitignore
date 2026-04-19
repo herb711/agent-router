@@ -1,0 +1,8 @@
+.env
+*.env
+proxy.env
+settings.json
+*.backup.*
+*.log
+node_modules/
+.DS_Store
