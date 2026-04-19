@@ -32,11 +32,12 @@ read_from_tty() {
 
   [ -r /dev/tty ] || die "interactive input requires a TTY. Run this script from a terminal."
 
+  printf '%s' "$prompt" >/dev/tty
   if [ "$silent" = "1" ]; then
-    read -r -s -p "$prompt" value </dev/tty
+    IFS= read -r -s value </dev/tty || die "failed to read input from terminal."
     printf '\n' >/dev/tty
   else
-    read -r -p "$prompt" value </dev/tty
+    IFS= read -r value </dev/tty || die "failed to read input from terminal."
   fi
 
   printf '%s' "$value"
