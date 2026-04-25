@@ -8,6 +8,8 @@ PROXY_DIR="${HOME}/.local/share/ccswitch-proxy"
 PROXY_BIN="${PROXY_DIR}/proxy.js"
 PROXY_ENV="${PROXY_DIR}/proxy.env"
 USER_BIN_DIR="${HOME}/.local/bin"
+NODE_ROOT="${HOME}/.local/share/codalane-node"
+NODE_VERSION="${CODALANE_NODE_VERSION:-20.18.1}"
 PROXY_LAUNCHER="${USER_BIN_DIR}/ccswitch-proxy"
 SERVICE_DIR="${HOME}/.config/systemd/user"
 SERVICE_FILE="${SERVICE_DIR}/ccswitch-proxy.service"
@@ -23,6 +25,52 @@ die() {
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+ensure_user_bin_dir() {
+  mkdir -p "$USER_BIN_DIR"
+  export PATH="${USER_BIN_DIR}:${PATH}"
+}
+
+node_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf '%s' "x64" ;;
+    aarch64|arm64) printf '%s' "arm64" ;;
+    *) die "unsupported CPU architecture for automatic Node.js install: $(uname -m)" ;;
+  esac
+}
+
+download_node_archive() {
+  local version="$1"
+  local arch="$2"
+  local output="$3"
+  local archive="node-v${version}-linux-${arch}.tar.xz"
+  local base_urls=(
+    "${CODALANE_NODE_MIRROR:-https://nodejs.org/dist}"
+    "https://npmmirror.com/mirrors/node"
+  )
+  local base_url
+
+  for base_url in "${base_urls[@]}"; do
+    say "Downloading Node.js from ${base_url}..."
+    if curl -fL --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 3 \
+      "${base_url}/v${version}/${archive}" -o "$output"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+link_node_commands() {
+  local node_dir="$1"
+  local cmd
+
+  ensure_user_bin_dir
+  for cmd in node npm npx; do
+    [ -x "${node_dir}/bin/${cmd}" ] || die "Node.js install is missing ${cmd}."
+    ln -sf "${node_dir}/bin/${cmd}" "${USER_BIN_DIR}/${cmd}"
+  done
 }
 
 read_from_tty() {
@@ -98,6 +146,8 @@ backup_if_exists() {
 }
 
 install_npm_if_needed() {
+  ensure_user_bin_dir
+
   if need_cmd npm; then
     return
   fi
@@ -105,34 +155,33 @@ install_npm_if_needed() {
   if ! need_cmd curl; then
     die "curl is not installed. Install curl first, then rerun this script."
   fi
-
-  say "npm not found. Installing Node.js via fnm (no sudo required)..."
-
-  local fnm_dir="${HOME}/.fnm"
-  local fnm_bin="${fnm_dir}/fnm"
-
-  if [ ! -f "$fnm_bin" ]; then
-    say "Downloading fnm..."
-    mkdir -p "${fnm_dir}"
-
-    local fnm_url="https://github.com/Schniz/fnm/releases/download/v1.39.2/fnm-linux-x64.tar.gz"
-    curl --location --max-time 60 --retry 3 --retry-delay 5 \
-      "$fnm_url" -o "${fnm_dir}/fnm-linux-x64.tar.gz" \
-      || die "Failed to download fnm. Check network to github.com."
-    tar -xzf "${fnm_dir}/fnm-linux-x64.tar.gz" -C "$fnm_dir" \
-      || die "Failed to extract fnm archive."
-    mv "${fnm_dir}/fnm" "$fnm_bin" \
-      || die "Failed to move fnm binary."
-    rm -f "${fnm_dir}/fnm-linux-x64.tar.gz"
+  if ! need_cmd tar; then
+    die "tar is not installed. Install tar first, then rerun this script."
   fi
 
-  export PATH="${fnm_dir}:${PATH}"
-  eval "$(fnm env --use-on-cd)" || die "fnm env failed"
-  fnm install 20 || die "fnm install 20 failed"
-  fnm default 20 || die "fnm default 20 failed"
+  local arch
+  arch="$(node_arch)"
+  local node_dir="${NODE_ROOT}/node-v${NODE_VERSION}-linux-${arch}"
+
+  say "npm not found. Installing Node.js ${NODE_VERSION} to ${NODE_ROOT} (no sudo required)..."
+
+  if [ ! -x "${node_dir}/bin/npm" ]; then
+    local tmp_dir
+    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codalane-node.XXXXXX")"
+    local archive="${tmp_dir}/node.tar.xz"
+
+    download_node_archive "$NODE_VERSION" "$arch" "$archive" \
+      || die "Failed to download Node.js. Check network access to nodejs.org or set CODALANE_NODE_MIRROR."
+
+    mkdir -p "$node_dir"
+    tar -xJf "$archive" -C "$node_dir" --strip-components=1 \
+      || die "Failed to extract Node.js archive."
+  fi
+
+  link_node_commands "$node_dir"
 
   if ! need_cmd npm; then
-    die "fnm installed but npm still not found. Check PATH after: eval \"\$(fnm env --use-on-cd)\""
+    die "Node.js installed but npm still not found. Add ${USER_BIN_DIR} to PATH, then rerun this script."
   fi
 
   say "Node.js and npm installed: $(node --version) / $(npm --version)"
@@ -148,7 +197,12 @@ install_claude_code() {
   install_npm_if_needed
 
   say "Installing Claude Code with npm..."
-  npm install -g @anthropic-ai/claude-code
+  ensure_user_bin_dir
+  npm install -g --prefix "${HOME}/.local" @anthropic-ai/claude-code
+
+  if ! need_cmd claude; then
+    die "Claude Code installed, but claude was not found on PATH. Add ${USER_BIN_DIR} to PATH, then rerun this script."
+  fi
 }
 
 write_direct_settings() {
@@ -365,11 +419,15 @@ main() {
 
   say
   say "Done."
+  local claude_cmd="claude"
+  if [ -x "${USER_BIN_DIR}/claude" ]; then
+    claude_cmd="${USER_BIN_DIR}/claude"
+  fi
   say "Test with:"
-  say "  claude -p '只回复 OK'"
+  say "  ${claude_cmd} -p '只回复 OK'"
   say
   say "Interactive Claude Code:"
-  say "  claude"
+  say "  ${claude_cmd}"
 }
 
 main "$@"

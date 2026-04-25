@@ -26,8 +26,8 @@ curl -fsSL https://raw.githubusercontent.com/herb711/c-code-switch/main/install.
 
 ## What It Does
 
-- Installs Claude Code with `npm install -g @anthropic-ai/claude-code` if `claude` is not already installed.
-- If `npm` is not found, automatically installs Node.js via [fnm](https://github.com/Schniz/fnm) (no sudo required).
+- Installs Claude Code into `~/.local` with npm if `claude` is not already installed.
+- If `npm` is not found, automatically installs Node.js under `~/.local/share/codalane-node` and links `node`, `npm`, and `npx` into `~/.local/bin` (no sudo required).
 - Lets the user choose the MiniMax endpoint:
   - China mainland: `https://api.minimaxi.com/anthropic`
   - International: `https://api.minimax.io/anthropic`
@@ -50,6 +50,12 @@ For interactive Claude Code:
 claude
 ```
 
+If `nodejs.org` is hard to reach from your network, set a Node.js mirror before running the installer:
+
+```bash
+export CODALANE_NODE_MIRROR=https://npmmirror.com/mirrors/node
+```
+
 ## Security
 
 Codalane does not ship with any API key. Users must provide their own MiniMax API key during installation.
@@ -70,4 +76,3 @@ Codalane is source-available under the PolyForm Noncommercial License 1.0.0.
 Non-commercial use is permitted. Commercial use requires a separate written license from the copyright holder. See [COMMERCIAL.md](COMMERCIAL.md).
 
 This is not an OSI-approved open source license.
-
