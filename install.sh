@@ -110,21 +110,25 @@ install_npm_if_needed() {
 
   local fnm_dir="${HOME}/.fnm"
   local fnm_bin="${fnm_dir}/fnm"
-  local fnm_url
-  fnm_url="$(curl -fsSL https://api.github.com/repos/Schniz/fnm/releases/latest | grep 'browser_download_url.*linux-x64"' | cut -d'"' -f4)"
 
-  if [ -z "$fnm_url" ]; then
-    die "Failed to find fnm release URL. Install Node.js manually, then rerun."
+  if [ ! -f "$fnm_bin" ]; then
+    say "Downloading fnm..."
+    local fnm_url
+    fnm_url="$(curl -fsSL --max-time 30 https://api.github.com/repos/Schniz/fnm/releases/latest | grep 'browser_download_url.*linux-x64"' | cut -d'"' -f4)"
+
+    if [ -z "$fnm_url" ]; then
+      die "Failed to fetch fnm release URL. Check network connectivity to github.com."
+    fi
+
+    mkdir -p "${fnm_dir}"
+    curl -fsSL --max-time 60 "$fnm_url" -o "$fnm_bin" || die "Failed to download fnm from: $fnm_url"
+    chmod +x "$fnm_bin"
   fi
 
-  mkdir -p "${fnm_dir}"
-  curl -fsSL "$fnm_url" -o "$fnm_bin"
-  chmod +x "$fnm_bin"
-
   export PATH="${fnm_dir}:${PATH}"
-  eval "$(fnm env --use-on-cd)"
-  fnm install 20
-  fnm default 20
+  eval "$(fnm env --use-on-cd)" || die "fnm env failed"
+  fnm install 20 || die "fnm install 20 failed"
+  fnm default 20 || die "fnm default 20 failed"
 
   if ! need_cmd npm; then
     die "fnm installed but npm still not found. Check PATH after: eval \"\$(fnm env --use-on-cd)\""
