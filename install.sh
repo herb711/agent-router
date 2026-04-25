@@ -113,16 +113,17 @@ install_npm_if_needed() {
 
   if [ ! -f "$fnm_bin" ]; then
     say "Downloading fnm..."
-    local fnm_url
-    fnm_url="$(curl -fsSL --max-time 30 https://api.github.com/repos/Schniz/fnm/releases/latest | grep 'browser_download_url.*linux-x64"' | cut -d'"' -f4)"
-
-    if [ -z "$fnm_url" ]; then
-      die "Failed to fetch fnm release URL. Check network connectivity to github.com."
-    fi
-
     mkdir -p "${fnm_dir}"
-    curl -fsSL --max-time 60 "$fnm_url" -o "$fnm_bin" || die "Failed to download fnm from: $fnm_url"
-    chmod +x "$fnm_bin"
+
+    local fnm_url="https://github.com/Schniz/fnm/releases/download/v1.39.2/fnm-linux-x64.tar.gz"
+    curl --location --max-time 60 --retry 3 --retry-delay 5 \
+      "$fnm_url" -o "${fnm_dir}/fnm-linux-x64.tar.gz" \
+      || die "Failed to download fnm. Check network to github.com."
+    tar -xzf "${fnm_dir}/fnm-linux-x64.tar.gz" -C "$fnm_dir" \
+      || die "Failed to extract fnm archive."
+    mv "${fnm_dir}/fnm" "$fnm_bin" \
+      || die "Failed to move fnm binary."
+    rm -f "${fnm_dir}/fnm-linux-x64.tar.gz"
   fi
 
   export PATH="${fnm_dir}:${PATH}"
