@@ -1,4 +1,4 @@
-# C-Code-Switch
+# agent-router
 
 Headless installer and local relay for configuring Claude Code with MiniMax's Anthropic-compatible API.
 
@@ -13,7 +13,7 @@ Requirements: `curl`. Node.js and npm are installed automatically if missing.
 Review the script before running it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/herb711/c-code-switch/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/herb711/agent-router/main/install.sh -o install.sh
 less install.sh
 bash install.sh
 ```
@@ -21,7 +21,7 @@ bash install.sh
 One-line install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/herb711/c-code-switch/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/herb711/agent-router/main/install.sh | bash
 ```
 
 ## What It Does
