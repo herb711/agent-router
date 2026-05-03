@@ -115,18 +115,31 @@ http://113.249.108.72:15581
 
 ### 配置 Codex CLI
 
-新版 Codex CLI 使用 OpenAI Responses API 协议。国内很多 OpenAI-compatible 服务还停在 Chat Completions，所以 Codex 配置会先询问上游协议：
+新版 Codex CLI 使用 OpenAI Responses API 协议。这个安装器面向国内或自建的 OpenAI-compatible 大模型服务，所以 Codex 配置会尽量只问两个信息：`base URL` 和 `API key`。
 
 ```text
-Choose Codex upstream protocol:
-  1) Responses API (OpenAI or compatible). Recommended for current Codex.
-  2) Chat Completions API (use local Responses adapter for older compatible services).
-Protocol choice [1]:
+OpenAI-compatible base URL [http://127.0.0.1:8000/v1]:
+API Key:
 ```
 
-如果上游已经支持 `/v1/responses`，选择 `1`。脚本会在 `~/.codex/config.toml` 写入自定义 provider，并设置 `wire_api = "responses"`。
+填完后，脚本会自动访问 `${base URL}/models` 获取可用模型，并把结果做成菜单：
 
-如果上游只支持 `/v1/chat/completions`，选择 `2`。脚本会安装独立的 Codex 本地适配代理：
+```text
+Checking models from http://113.249.108.72:15581/v1/models...
+Discovered models:
+  1) Qwen/Qwen3.6-35B-A3B
+  2) Custom model name
+Model choice [1]:
+```
+
+如果扫不到模型，才会让你手动填写模型名：
+
+```text
+Could not discover models from http://113.249.108.72:15581/v1/models.
+Model name:
+```
+
+国内很多服务的 OpenAI-compatible 接口实际还是 Chat Completions。脚本会自动为 Codex 安装独立的本地 Responses 适配代理：
 
 ```text
 ~/.local/bin/agent-router-codex-proxy
@@ -134,7 +147,7 @@ Protocol choice [1]:
 ~/.config/systemd/user/agent-router-codex-proxy.service
 ```
 
-这样 Codex 仍然访问本地 `/v1/responses`，由代理再转发到上游 `/chat/completions`。
+这样 Codex 仍然访问本地 `/v1/responses`，由代理再转发到上游 `/chat/completions`。除非你填写的是 OpenAI 官方 Responses 地址，Codex 默认都会走这个适配路径。
 
 ### 选择模型
 
@@ -361,7 +374,7 @@ curl http://127.0.0.1:8080/health
 ### 当前版本
 
 - 新增 vLLM OpenAI-compatible API 支持，通过本地 `agent-router-proxy` 适配 Claude Code 的 Anthropic Messages API。
-- 新增 Codex CLI 安装，并统一由 `ccr` 根据已安装的 Claude Code / Codex CLI 自动分流。Codex 配置固定使用 `wire_api = "responses"`，并可为仍停留在 Chat Completions 的上游启用独立本地 Responses-to-Chat-Completions 适配代理。
+- 新增 Codex CLI 安装，并统一由 `ccr` 根据已安装的 Claude Code / Codex CLI 自动分流。Codex 先选模型，再自动选择 Responses API 或本地 Responses-to-Chat-Completions 适配代理；配置固定使用 `wire_api = "responses"`。
 - vLLM 配置流程调整为先填写 base URL，再自动发现 `/models`，发现失败时手动输入模型名，最后填写 API key。
 - 修复 systemd 用户服务启动代理时找不到 `node` 的问题。
 - 本地代理服务统一命名为 `agent-router-proxy.service`，避免与其他项目重名。

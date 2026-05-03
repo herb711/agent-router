@@ -295,10 +295,15 @@ const chunks = [];
 process.stdin.on("data", chunk => chunks.push(chunk));
 process.stdin.on("end", () => {
   const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  const models = Array.isArray(payload.data) ? payload.data : [];
-  for (const model of models) {
-    if (model && typeof model.id === "string" && model.id.length > 0) {
-      console.log(model.id);
+  const sources = [];
+  if (Array.isArray(payload.data)) sources.push(...payload.data);
+  if (Array.isArray(payload.models)) sources.push(...payload.models);
+  const seen = new Set();
+  for (const model of sources) {
+    const id = typeof model === "string" ? model : model && (model.id || model.slug || model.name);
+    if (typeof id === "string" && id.length > 0 && !seen.has(id)) {
+      seen.add(id);
+      console.log(id);
     }
   }
 });
@@ -313,8 +318,14 @@ select_discovered_model_menu() {
   local choice
   local custom_choice
   local default_choice=1
+  local preferred="${AGENT_ROUTER_DEFAULT_MODEL:-}"
 
   custom_choice=$((${#models[@]} + 1))
+  for i in "${!models[@]}"; do
+    if [ -n "$preferred" ] && [ "${models[$i]}" = "$preferred" ]; then
+      default_choice=$((i + 1))
+    fi
+  done
 
   tty_say "$prompt:"
   for i in "${!models[@]}"; do
@@ -352,7 +363,7 @@ select_openai_model_from_base_url() {
     done <<< "$model_lines"
 
     if [ "${#models[@]}" -gt 0 ]; then
-      select_discovered_model_menu "Discovered models" "${models[@]}"
+      AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Discovered models" "${models[@]}"
       return
     fi
   fi
@@ -388,6 +399,13 @@ backup_if_exists() {
     cp "$file" "$backup"
     say "Backed up existing file: $backup"
   fi
+}
+
+env_file_value() {
+  local file="$1"
+  local key="$2"
+  [ -f "$file" ] || return 1
+  sed -n "s/^${key}=//p" "$file" | head -n 1
 }
 
 install_npm_if_needed() {
@@ -1041,6 +1059,59 @@ function openAIChatToResponses(payload, requestedModel) {
   };
 }
 
+function codexModelInfo(model) {
+  const id = model && typeof model.id === 'string' && model.id ? model.id : String(model || provider);
+  const contextWindow = Number(model && (model.context_window || model.max_model_len)) || 32768;
+  const reasoningLevels = ['low', 'medium', 'high'].map(effort => ({
+    effort,
+    description: `${effort[0].toUpperCase()}${effort.slice(1)} reasoning`,
+    limit: null
+  }));
+
+  return {
+    slug: id,
+    display_name: id,
+    description: 'OpenAI-compatible Chat Completions model through agent-router',
+    max_tokens: contextWindow,
+    max_output_tokens: Math.min(contextWindow, maxTokensLimit > 0 ? maxTokensLimit : 4096),
+    context_window: contextWindow,
+    supported_reasoning_levels: reasoningLevels,
+    default_reasoning_level: 'high',
+    supported_reasoning_summaries: [],
+    supports_reasoning_summaries: false,
+    support_verbosity: false,
+    default_verbosity: null,
+    supported_tools: [],
+    experimental_supported_tools: [],
+    allowed_tools: [],
+    shell_type: 'shell_command',
+    requires_openai_api_key: false,
+    supports_parallel_tool_calls: true,
+    supports_image_input: false,
+    supports_image_detail_original: false,
+    supports_apply_patch: false,
+    apply_patch_tool_type: null,
+    supports_local_shell_tool: true,
+    supports_streaming: true,
+    supported_in_api: true,
+    visibility: 'list',
+    priority: 0,
+    minimal_client_version: [0, 0, 0],
+    upgrade: null,
+    base_instructions: '',
+    truncation_policy: { mode: 'tokens', limit: contextWindow }
+  };
+}
+
+function openAIModelsToCodexModels(payload) {
+  const models = Array.isArray(payload && payload.data) ? payload.data : [];
+  return {
+    models: models
+      .filter(model => model && typeof model.id === 'string' && model.id)
+      .map(codexModelInfo)
+  };
+}
+
 function sendResponseEvent(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -1327,6 +1398,43 @@ const server = http.createServer((req, res) => {
   }
 
   const requestPath = req.url.split('?')[0];
+  if (req.method === 'GET' && (requestPath === '/v1/models' || requestPath === '/models')) {
+    const options = {
+      hostname: upstream.hostname,
+      port: upstream.port || (upstream.protocol === 'https:' ? 443 : 80),
+      path: upstreamPath('/models'),
+      method: 'GET',
+      headers: authHeaders()
+    };
+
+    const proxyReq = client.request(options, proxyRes => {
+      const responseChunks = [];
+      proxyRes.on('data', chunk => responseChunks.push(chunk));
+      proxyRes.on('end', () => {
+        const rawResponse = Buffer.concat(responseChunks);
+        if ((proxyRes.statusCode || 500) >= 400) {
+          res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+          res.end(rawResponse);
+          return;
+        }
+
+        try {
+          const payload = JSON.parse(rawResponse.toString('utf8'));
+          sendJson(res, 200, normalizedApiFormat === 'responses-chat' ? openAIModelsToCodexModels(payload) : payload);
+        } catch (err) {
+          sendJson(res, 502, { error: `failed to parse upstream models response: ${err.message}` });
+        }
+      });
+    });
+
+    proxyReq.on('error', err => {
+      sendJson(res, 502, { error: `upstream error: ${err.message}` });
+    });
+
+    proxyReq.end();
+    return;
+  }
+
   const isMessagesRequest = requestPath === '/v1/messages';
   const isResponsesRequest = requestPath === '/v1/responses' || requestPath === '/responses';
   if (req.method !== 'POST') {
@@ -1576,9 +1684,13 @@ Environment=PATH=${USER_BIN_DIR}:/usr/local/bin:/usr/bin:/bin
 WantedBy=default.target
 EOF_SERVICE
 
-  systemctl --user daemon-reload
-  systemctl --user enable --now agent-router-codex-proxy.service
-  say "Started user service: agent-router-codex-proxy.service"
+  if systemctl --user daemon-reload && systemctl --user enable --now agent-router-codex-proxy.service; then
+    say "Started user service: agent-router-codex-proxy.service"
+  else
+    say "Could not start agent-router-codex-proxy.service automatically."
+    say "Start it manually with: systemctl --user start agent-router-codex-proxy.service"
+    say "Or run the proxy directly with: $CODEX_PROXY_LAUNCHER"
+  fi
 }
 
 codex_config_root_value() {
@@ -1594,6 +1706,142 @@ codex_config_root_value() {
       exit
     }
   ' "$CODEX_CONFIG_FILE"
+}
+
+codex_config_provider_value() {
+  local key="$1"
+  [ -f "$CODEX_CONFIG_FILE" ] || return 1
+  awk -v key="$key" '
+    /^\[model_providers\.agent-router-codex\]/ { in_provider = 1; next }
+    /^\[/ { if (in_provider) exit; in_provider = 0 }
+    in_provider && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      gsub(/^"|"$/, "")
+      print
+      exit
+    }
+  ' "$CODEX_CONFIG_FILE"
+}
+
+codex_current_upstream_base_url() {
+  local base_url
+  base_url="$(env_file_value "$CODEX_PROXY_ENV" UPSTREAM_BASE_URL || true)"
+  if [ -n "$base_url" ]; then
+    printf '%s' "$base_url"
+    return
+  fi
+  codex_config_provider_value base_url || true
+}
+
+codex_current_api_key() {
+  local api_key
+  api_key="$(env_file_value "$CODEX_PROXY_ENV" UPSTREAM_API_KEY || true)"
+  if [ -n "$api_key" ]; then
+    printf '%s' "$api_key"
+    return
+  fi
+  env_file_value "$CODEX_ENV" CODEX_PROVIDER_API_KEY || true
+}
+
+codex_base_url_api_format() {
+  local base_url="$1"
+  local lower
+  lower="$(printf '%s' "$base_url" | tr '[:upper:]' '[:lower:]')"
+
+  case "$lower" in
+    https://api.openai.com/v1|https://api.openai.com/v1/*)
+      printf '%s' "responses"
+      ;;
+    *)
+      printf '%s' "responses-chat"
+      ;;
+  esac
+}
+
+codex_current_proxy_port() {
+  local port
+  port="$(env_file_value "$CODEX_PROXY_ENV" PORT 2>/dev/null || true)"
+  printf '%s' "${port:-8081}"
+}
+
+codex_model_note() {
+  local model="$1"
+
+  case "$model" in
+    gpt-5.5) printf '%s' "OpenAI Responses, recommended" ;;
+    gpt-5.4) printf '%s' "OpenAI Responses" ;;
+    gpt-5.4-mini) printf '%s' "OpenAI Responses, small/fast" ;;
+    gpt-5.3-codex) printf '%s' "OpenAI Responses, coding" ;;
+    gpt-5.3-codex-spark) printf '%s' "OpenAI Responses, fast coding" ;;
+  esac
+}
+
+select_codex_model_menu() {
+  local default_model="$1"
+  local models=(
+    "gpt-5.5"
+    "gpt-5.4"
+    "gpt-5.4-mini"
+    "gpt-5.3-codex"
+    "gpt-5.3-codex-spark"
+  )
+  local i
+  local model
+  local note
+  local choice
+  local custom_choice
+  local default_choice=1
+
+  custom_choice=$((${#models[@]} + 1))
+  for i in "${!models[@]}"; do
+    if [ "${models[$i]}" = "$default_model" ]; then
+      default_choice=$((i + 1))
+    fi
+  done
+  if ! printf '%s\n' "${models[@]}" | grep -Fxq "$default_model"; then
+    default_choice="$custom_choice"
+  fi
+
+  tty_say "Codex model:"
+  for i in "${!models[@]}"; do
+    model="${models[$i]}"
+    note="$(codex_model_note "$model")"
+    if [ -n "$note" ]; then
+      tty_say "  $((i + 1))) ${model} (${note})"
+    else
+      tty_say "  $((i + 1))) ${model}"
+    fi
+  done
+  tty_say "  ${custom_choice}) Custom/local model name"
+
+  choice="$(prompt_default 'Model choice' "$default_choice")"
+  if [[ "$choice" =~ ^[0-9]+$ ]]; then
+    if [ "$choice" -ge 1 ] && [ "$choice" -le "${#models[@]}" ]; then
+      printf '%s' "${models[$((choice - 1))]}"
+      return
+    fi
+    if [ "$choice" -eq "$custom_choice" ]; then
+      printf '%s' "$(prompt_default 'Custom/local model name' "$default_model")"
+      return
+    fi
+  fi
+
+  printf '%s' "$choice"
+}
+
+codex_model_api_format() {
+  local model="$1"
+  local lower
+  lower="$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')"
+
+  case "$lower" in
+    gpt-*|o[0-9]*|chatgpt-*|openai/*|codex-*)
+      printf '%s' "responses"
+      ;;
+    *)
+      printf '%s' "responses-chat"
+      ;;
+  esac
 }
 
 write_codex_auth_files() {
@@ -1710,68 +1958,55 @@ EOF_CODEX_CONFIG
 }
 
 configure_codex_provider() {
-  local default_model="${1:-gpt-5.5}"
+  local default_model="${1:-}"
   local existing_model
   existing_model="$(codex_config_root_value model || true)"
   [ -n "$existing_model" ] && default_model="$existing_model"
 
-  say "Choose Codex upstream protocol:"
-  say "  1) Responses API (OpenAI or compatible). Recommended for current Codex."
-  say "  2) Chat Completions API (use local Responses adapter for older compatible services)."
-  local protocol_choice
-  protocol_choice="$(prompt_default 'Protocol choice' '1')"
-
-  local api_format="responses"
-  local base_url
   local default_base_url
-  local provider_name
-  case "$protocol_choice" in
-    2)
-      api_format="responses-chat"
-      default_base_url="http://127.0.0.1:8000/v1"
-      provider_name="Agent Router Chat Completions Adapter"
-      base_url="$(normalize_openai_base_url "$(prompt_default 'Chat Completions-compatible base URL' "$default_base_url")")"
-      say "Codex will call the local Responses API adapter; upstream Chat Completions endpoint: ${base_url}"
-      ;;
-    *)
-      default_base_url="https://api.openai.com/v1"
-      provider_name="Agent Router Responses API"
-      base_url="$(normalize_openai_base_url "$(prompt_default 'Responses-compatible base URL' "$default_base_url")")"
-      say "Codex Responses endpoint: ${base_url}"
-      ;;
-  esac
+  default_base_url="$(codex_current_upstream_base_url || true)"
+  default_base_url="${default_base_url:-http://127.0.0.1:8000/v1}"
 
+  local base_url
+  base_url="$(normalize_openai_base_url "$(prompt_default 'OpenAI-compatible base URL' "$default_base_url")")"
+
+  local existing_api_key
+  existing_api_key="$(codex_current_api_key || true)"
   local api_key
-  if [ "$api_format" = "responses-chat" ]; then
-    say "API Key input is hidden. Leave empty to use EMPTY for a local server without auth."
+  if [ -n "$existing_api_key" ]; then
+    say "API Key input is hidden. Press Enter to reuse the saved key."
+    api_key="$(prompt_secret 'API Key')"
+    api_key="${api_key:-$existing_api_key}"
+  else
+    say "API Key input is hidden. Leave empty only for a local/no-auth server."
     api_key="$(prompt_secret 'API Key')"
     api_key="${api_key:-EMPTY}"
-  else
-    say "API Key input is hidden. Paste the key, then press Enter."
-    api_key="$(prompt_required_secret 'API Key')"
   fi
 
   local model
   model="$(select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
 
-  local reasoning_effort
-  reasoning_effort="$(prompt_default 'Codex reasoning effort' 'high')"
+  local api_format
+  api_format="$(codex_base_url_api_format "$base_url")"
+  local provider_name
+  if [ "$api_format" = "responses-chat" ]; then
+    provider_name="Agent Router Chat Completions Adapter"
+    say "Using local Responses adapter for OpenAI-compatible Chat Completions upstream: ${base_url}"
+  else
+    provider_name="Agent Router Responses API"
+    say "Using Responses API endpoint directly: ${base_url}"
+  fi
+
+  local reasoning_effort="high"
 
   write_codex_auth_files "$api_key"
 
   if [ "$api_format" = "responses-chat" ]; then
-    say
-    say "Codex uses Responses API. This upstream uses Chat Completions, so the local adapter proxy is required."
     local port
-    port="$(prompt_default 'Local proxy port' '8081')"
+    port="$(codex_current_proxy_port)"
     write_codex_proxy_files "codex" "$base_url" "$api_key" "$port" "authorization" "$api_format"
     write_codex_config "http://127.0.0.1:${port}/v1" "$model" "$provider_name" "$reasoning_effort"
-
-    if confirm 'Start proxy as a systemd user service now?' 'Y'; then
-      write_codex_proxy_service
-    else
-      say "Proxy can be started manually with: $CODEX_PROXY_LAUNCHER"
-    fi
+    write_codex_proxy_service
   else
     write_codex_config "$base_url" "$model" "$provider_name" "$reasoning_effort"
   fi
@@ -2021,10 +2256,15 @@ const chunks = [];
 process.stdin.on("data", chunk => chunks.push(chunk));
 process.stdin.on("end", () => {
   const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  const models = Array.isArray(payload.data) ? payload.data : [];
-  for (const model of models) {
-    if (model && typeof model.id === "string" && model.id.length > 0) {
-      console.log(model.id);
+  const sources = [];
+  if (Array.isArray(payload.data)) sources.push(...payload.data);
+  if (Array.isArray(payload.models)) sources.push(...payload.models);
+  const seen = new Set();
+  for (const model of sources) {
+    const id = typeof model === "string" ? model : model && (model.id || model.slug || model.name);
+    if (typeof id === "string" && id.length > 0 && !seen.has(id)) {
+      seen.add(id);
+      console.log(id);
     }
   }
 });
@@ -2039,8 +2279,14 @@ select_discovered_model_menu() {
   local choice
   local custom_choice
   local default_choice=1
+  local preferred="${AGENT_ROUTER_DEFAULT_MODEL:-}"
 
   custom_choice=$((${#models[@]} + 1))
+  for i in "${!models[@]}"; do
+    if [ -n "$preferred" ] && [ "${models[$i]}" = "$preferred" ]; then
+      default_choice=$((i + 1))
+    fi
+  done
 
   tty_say "$prompt:"
   for i in "${!models[@]}"; do
@@ -2077,7 +2323,7 @@ select_openai_model_from_base_url() {
     done <<< "$model_lines"
 
     if [ "${#models[@]}" -gt 0 ]; then
-      select_discovered_model_menu "Discovered models" "${models[@]}"
+      AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Discovered models" "${models[@]}"
       return
     fi
   fi
@@ -2742,6 +2988,59 @@ function openAIChatToResponses(payload, requestedModel) {
   };
 }
 
+function codexModelInfo(model) {
+  const id = model && typeof model.id === 'string' && model.id ? model.id : String(model || provider);
+  const contextWindow = Number(model && (model.context_window || model.max_model_len)) || 32768;
+  const reasoningLevels = ['low', 'medium', 'high'].map(effort => ({
+    effort,
+    description: `${effort[0].toUpperCase()}${effort.slice(1)} reasoning`,
+    limit: null
+  }));
+
+  return {
+    slug: id,
+    display_name: id,
+    description: 'OpenAI-compatible Chat Completions model through agent-router',
+    max_tokens: contextWindow,
+    max_output_tokens: Math.min(contextWindow, maxTokensLimit > 0 ? maxTokensLimit : 4096),
+    context_window: contextWindow,
+    supported_reasoning_levels: reasoningLevels,
+    default_reasoning_level: 'high',
+    supported_reasoning_summaries: [],
+    supports_reasoning_summaries: false,
+    support_verbosity: false,
+    default_verbosity: null,
+    supported_tools: [],
+    experimental_supported_tools: [],
+    allowed_tools: [],
+    shell_type: 'shell_command',
+    requires_openai_api_key: false,
+    supports_parallel_tool_calls: true,
+    supports_image_input: false,
+    supports_image_detail_original: false,
+    supports_apply_patch: false,
+    apply_patch_tool_type: null,
+    supports_local_shell_tool: true,
+    supports_streaming: true,
+    supported_in_api: true,
+    visibility: 'list',
+    priority: 0,
+    minimal_client_version: [0, 0, 0],
+    upgrade: null,
+    base_instructions: '',
+    truncation_policy: { mode: 'tokens', limit: contextWindow }
+  };
+}
+
+function openAIModelsToCodexModels(payload) {
+  const models = Array.isArray(payload && payload.data) ? payload.data : [];
+  return {
+    models: models
+      .filter(model => model && typeof model.id === 'string' && model.id)
+      .map(codexModelInfo)
+  };
+}
+
 function sendResponseEvent(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -3028,6 +3327,43 @@ const server = http.createServer((req, res) => {
   }
 
   const requestPath = req.url.split('?')[0];
+  if (req.method === 'GET' && (requestPath === '/v1/models' || requestPath === '/models')) {
+    const options = {
+      hostname: upstream.hostname,
+      port: upstream.port || (upstream.protocol === 'https:' ? 443 : 80),
+      path: upstreamPath('/models'),
+      method: 'GET',
+      headers: authHeaders()
+    };
+
+    const proxyReq = client.request(options, proxyRes => {
+      const responseChunks = [];
+      proxyRes.on('data', chunk => responseChunks.push(chunk));
+      proxyRes.on('end', () => {
+        const rawResponse = Buffer.concat(responseChunks);
+        if ((proxyRes.statusCode || 500) >= 400) {
+          res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+          res.end(rawResponse);
+          return;
+        }
+
+        try {
+          const payload = JSON.parse(rawResponse.toString('utf8'));
+          sendJson(res, 200, normalizedApiFormat === 'responses-chat' ? openAIModelsToCodexModels(payload) : payload);
+        } catch (err) {
+          sendJson(res, 502, { error: `failed to parse upstream models response: ${err.message}` });
+        }
+      });
+    });
+
+    proxyReq.on('error', err => {
+      sendJson(res, 502, { error: `upstream error: ${err.message}` });
+    });
+
+    proxyReq.end();
+    return;
+  }
+
   const isMessagesRequest = requestPath === '/v1/messages';
   const isResponsesRequest = requestPath === '/v1/responses' || requestPath === '/responses';
   if (req.method !== 'POST') {
@@ -3636,10 +3972,15 @@ const chunks = [];
 process.stdin.on("data", chunk => chunks.push(chunk));
 process.stdin.on("end", () => {
   const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  const models = Array.isArray(payload.data) ? payload.data : [];
-  for (const model of models) {
-    if (model && typeof model.id === "string" && model.id.length > 0) {
-      console.log(model.id);
+  const sources = [];
+  if (Array.isArray(payload.data)) sources.push(...payload.data);
+  if (Array.isArray(payload.models)) sources.push(...payload.models);
+  const seen = new Set();
+  for (const model of sources) {
+    const id = typeof model === "string" ? model : model && (model.id || model.slug || model.name);
+    if (typeof id === "string" && id.length > 0 && !seen.has(id)) {
+      seen.add(id);
+      console.log(id);
     }
   }
 });
@@ -3654,8 +3995,14 @@ select_discovered_model_menu() {
   local choice
   local custom_choice
   local default_choice=1
+  local preferred="${AGENT_ROUTER_DEFAULT_MODEL:-}"
 
   custom_choice=$((${#models[@]} + 1))
+  for i in "${!models[@]}"; do
+    if [ -n "$preferred" ] && [ "${models[$i]}" = "$preferred" ]; then
+      default_choice=$((i + 1))
+    fi
+  done
 
   tty_say "$prompt:"
   for i in "${!models[@]}"; do
@@ -3693,7 +4040,7 @@ select_openai_model_from_base_url() {
     done <<< "$model_lines"
 
     if [ "${#models[@]}" -gt 0 ]; then
-      select_discovered_model_menu "Discovered models" "${models[@]}"
+      AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Discovered models" "${models[@]}"
       return
     fi
   fi
@@ -3719,6 +4066,149 @@ codex_config_root_value() {
       exit
     }
   ' "$CODEX_CONFIG_FILE"
+}
+
+env_file_value() {
+  local file="$1"
+  local key="$2"
+  [ -f "$file" ] || return 1
+  sed -n "s/^${key}=//p" "$file" | head -n 1
+}
+
+codex_config_provider_value() {
+  local key="$1"
+  [ -f "$CODEX_CONFIG_FILE" ] || return 1
+  awk -v key="$key" '
+    /^\[model_providers\.agent-router-codex\]/ { in_provider = 1; next }
+    /^\[/ { if (in_provider) exit; in_provider = 0 }
+    in_provider && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      gsub(/^"|"$/, "")
+      print
+      exit
+    }
+  ' "$CODEX_CONFIG_FILE"
+}
+
+codex_current_upstream_base_url() {
+  local base_url
+  base_url="$(env_file_value "$CODEX_PROXY_ENV" UPSTREAM_BASE_URL || true)"
+  if [ -n "$base_url" ]; then
+    printf '%s' "$base_url"
+    return
+  fi
+  codex_config_provider_value base_url || true
+}
+
+codex_current_api_key() {
+  local api_key
+  api_key="$(env_file_value "$CODEX_PROXY_ENV" UPSTREAM_API_KEY || true)"
+  if [ -n "$api_key" ]; then
+    printf '%s' "$api_key"
+    return
+  fi
+  env_file_value "$CODEX_ENV" CODEX_PROVIDER_API_KEY || true
+}
+
+codex_base_url_api_format() {
+  local base_url="$1"
+  local lower
+  lower="$(printf '%s' "$base_url" | tr '[:upper:]' '[:lower:]')"
+
+  case "$lower" in
+    https://api.openai.com/v1|https://api.openai.com/v1/*)
+      printf '%s' "responses"
+      ;;
+    *)
+      printf '%s' "responses-chat"
+      ;;
+  esac
+}
+
+codex_current_proxy_port() {
+  local port
+  port="$(env_file_value "$CODEX_PROXY_ENV" PORT 2>/dev/null || true)"
+  printf '%s' "${port:-8081}"
+}
+
+codex_model_note() {
+  local model="$1"
+
+  case "$model" in
+    gpt-5.5) printf '%s' "OpenAI Responses, recommended" ;;
+    gpt-5.4) printf '%s' "OpenAI Responses" ;;
+    gpt-5.4-mini) printf '%s' "OpenAI Responses, small/fast" ;;
+    gpt-5.3-codex) printf '%s' "OpenAI Responses, coding" ;;
+    gpt-5.3-codex-spark) printf '%s' "OpenAI Responses, fast coding" ;;
+  esac
+}
+
+select_codex_model_menu() {
+  local default_model="$1"
+  local models=(
+    "gpt-5.5"
+    "gpt-5.4"
+    "gpt-5.4-mini"
+    "gpt-5.3-codex"
+    "gpt-5.3-codex-spark"
+  )
+  local i
+  local model
+  local note
+  local choice
+  local custom_choice
+  local default_choice=1
+
+  custom_choice=$((${#models[@]} + 1))
+  for i in "${!models[@]}"; do
+    if [ "${models[$i]}" = "$default_model" ]; then
+      default_choice=$((i + 1))
+    fi
+  done
+  if ! printf '%s\n' "${models[@]}" | grep -Fxq "$default_model"; then
+    default_choice="$custom_choice"
+  fi
+
+  tty_say "Codex model:"
+  for i in "${!models[@]}"; do
+    model="${models[$i]}"
+    note="$(codex_model_note "$model")"
+    if [ -n "$note" ]; then
+      tty_say "  $((i + 1))) ${model} (${note})"
+    else
+      tty_say "  $((i + 1))) ${model}"
+    fi
+  done
+  tty_say "  ${custom_choice}) Custom/local model name"
+
+  choice="$(prompt_default 'Model choice' "$default_choice")"
+  if [[ "$choice" =~ ^[0-9]+$ ]]; then
+    if [ "$choice" -ge 1 ] && [ "$choice" -le "${#models[@]}" ]; then
+      printf '%s' "${models[$((choice - 1))]}"
+      return
+    fi
+    if [ "$choice" -eq "$custom_choice" ]; then
+      printf '%s' "$(prompt_default 'Custom/local model name' "$default_model")"
+      return
+    fi
+  fi
+
+  printf '%s' "$choice"
+}
+
+codex_model_api_format() {
+  local model="$1"
+  local lower
+  lower="$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')"
+
+  case "$lower" in
+    gpt-*|o[0-9]*|chatgpt-*|openai/*|codex-*)
+      printf '%s' "responses"
+      ;;
+    *)
+      printf '%s' "responses-chat"
+      ;;
+  esac
 }
 
 write_codex_auth_files() {
@@ -3866,8 +4356,12 @@ restart_proxy_service_if_running() {
   fi
 
   if [ -f "$CODEX_SERVICE_FILE" ]; then
-    say "Proxy service exists but is not running. Start it with:"
-    say "  systemctl --user start agent-router-codex-proxy.service"
+    if systemctl --user daemon-reload && systemctl --user start agent-router-codex-proxy.service; then
+      say "Started user service: agent-router-codex-proxy.service"
+    else
+      say "Proxy service exists but could not be started automatically. Start it with:"
+      say "  systemctl --user start agent-router-codex-proxy.service"
+    fi
   else
     say "Proxy can be started manually with: $CODEX_PROXY_LAUNCHER"
   fi
@@ -3879,55 +4373,51 @@ main() {
 
   local current_model
   current_model="$(codex_config_root_value model || true)"
+  local current_base_url
+  current_base_url="$(codex_current_upstream_base_url || true)"
   say "Current Codex model: ${current_model:-not configured}"
+  say "Current upstream base URL: ${current_base_url:-not configured}"
   say
 
-  say "Choose Codex upstream protocol:"
-  say "  1) Responses API (OpenAI or compatible). Recommended for current Codex."
-  say "  2) Chat Completions API (use local Responses adapter for older compatible services)."
-  local protocol_choice
-  protocol_choice="$(prompt_default 'Protocol choice' '1')"
-
-  local default_model="${current_model:-gpt-5.5}"
-  local api_format="responses"
-  local default_base_url
-  local provider_name
+  local default_model="$current_model"
+  local default_base_url="${current_base_url:-http://127.0.0.1:8000/v1}"
   local base_url
+  base_url="$(normalize_openai_base_url "$(prompt_default 'OpenAI-compatible base URL' "$default_base_url")")"
 
-  case "$protocol_choice" in
-    2)
-      api_format="responses-chat"
-      default_base_url="http://127.0.0.1:8000/v1"
-      provider_name="Agent Router Chat Completions Adapter"
-      base_url="$(normalize_openai_base_url "$(prompt_default 'Chat Completions-compatible base URL' "$default_base_url")")"
-      ;;
-    *)
-      default_base_url="https://api.openai.com/v1"
-      provider_name="Agent Router Responses API"
-      base_url="$(normalize_openai_base_url "$(prompt_default 'Responses-compatible base URL' "$default_base_url")")"
-      ;;
-  esac
-
+  local existing_api_key
+  existing_api_key="$(codex_current_api_key || true)"
   local api_key
-  if [ "$api_format" = "responses-chat" ]; then
-    say "API Key input is hidden. Leave empty to use EMPTY for a local server without auth."
+  if [ -n "$existing_api_key" ]; then
+    say "API Key input is hidden. Press Enter to reuse the saved key."
+    api_key="$(prompt_secret 'API Key')"
+    api_key="${api_key:-$existing_api_key}"
+  else
+    say "API Key input is hidden. Leave empty only for a local/no-auth server."
     api_key="$(prompt_secret 'API Key')"
     api_key="${api_key:-EMPTY}"
-  else
-    say "API Key input is hidden. Paste the key, then press Enter."
-    api_key="$(prompt_required_secret 'API Key')"
   fi
 
   local model
   model="$(select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
-  local reasoning_effort
-  reasoning_effort="$(prompt_default 'Codex reasoning effort' 'high')"
+
+  local api_format
+  api_format="$(codex_base_url_api_format "$base_url")"
+  local provider_name
+  if [ "$api_format" = "responses-chat" ]; then
+    provider_name="Agent Router Chat Completions Adapter"
+    say "Using local Responses adapter for OpenAI-compatible Chat Completions upstream: ${base_url}"
+  else
+    provider_name="Agent Router Responses API"
+    say "Using Responses API endpoint directly: ${base_url}"
+  fi
+
+  local reasoning_effort="high"
 
   write_codex_auth_files "$api_key"
 
   if [ "$api_format" = "responses-chat" ]; then
     local port
-    port="$(prompt_default 'Local proxy port' '8081')"
+    port="$(codex_current_proxy_port)"
     write_proxy_env_for_codex_chat "$base_url" "$api_key" "$port"
     write_codex_config "http://127.0.0.1:${port}/v1" "$model" "$provider_name" "$reasoning_effort"
     restart_proxy_service_if_running

@@ -115,18 +115,31 @@ The script automatically appends `/v1`.
 
 ### Configure Codex CLI
 
-Codex CLI uses the OpenAI Responses API protocol. Some OpenAI-compatible services, especially domestic or self-hosted deployments, still expose only Chat Completions. For that reason Codex setup asks for the upstream protocol:
+Codex CLI uses the OpenAI Responses API protocol. This installer is optimized for domestic or self-hosted OpenAI-compatible model services, so Codex setup tries to ask for only two values: `base URL` and `API key`.
 
 ```text
-Choose Codex upstream protocol:
-  1) Responses API (OpenAI or compatible). Recommended for current Codex.
-  2) Chat Completions API (use local Responses adapter for older compatible services).
-Protocol choice [1]:
+OpenAI-compatible base URL [http://127.0.0.1:8000/v1]:
+API Key:
 ```
 
-Choose `1` for OpenAI or a provider that already supports `/v1/responses`. The installer writes a custom Codex provider with `wire_api = "responses"` in `~/.codex/config.toml`.
+After that, the script calls `${base URL}/models` automatically and turns the returned models into a menu:
 
-Choose `2` for vLLM or OpenAI-compatible services that only support `/v1/chat/completions`. The installer creates a separate local Codex adapter:
+```text
+Checking models from http://113.249.108.72:15581/v1/models...
+Discovered models:
+  1) Qwen/Qwen3.6-35B-A3B
+  2) Custom model name
+Model choice [1]:
+```
+
+Only if discovery fails does the installer ask for a model name manually:
+
+```text
+Could not discover models from http://113.249.108.72:15581/v1/models.
+Model name:
+```
+
+Many domestic OpenAI-compatible endpoints still expose Chat Completions rather than Responses. The script automatically creates a separate local Codex Responses adapter:
 
 ```text
 ~/.local/bin/agent-router-codex-proxy
@@ -134,7 +147,7 @@ Choose `2` for vLLM or OpenAI-compatible services that only support `/v1/chat/co
 ~/.config/systemd/user/agent-router-codex-proxy.service
 ```
 
-Codex then calls `http://127.0.0.1:<port>/v1/responses`, while the adapter calls the upstream `/chat/completions` endpoint.
+Codex then calls the local `/v1/responses` endpoint, while the adapter calls the upstream `/chat/completions` endpoint. Unless you enter the official OpenAI Responses URL, Codex defaults to this adapter path.
 
 ### Choose Model
 
@@ -361,7 +374,7 @@ curl http://127.0.0.1:8080/health
 ### Current Version
 
 - Added vLLM OpenAI-compatible API support through the local `agent-router-proxy` adapter for Claude Code's Anthropic Messages API.
-- Added Codex CLI setup and unified switching through `ccr`, which auto-routes based on installed Claude Code / Codex CLI commands. Codex configuration uses `wire_api = "responses"` and can optionally run a separate local Responses-to-Chat-Completions adapter for upstreams that have not implemented Responses API yet.
+- Added Codex CLI setup and unified switching through `ccr`, which auto-routes based on installed Claude Code / Codex CLI commands. Codex now asks for the model first, then automatically chooses Responses API or the local Responses-to-Chat-Completions adapter; configuration always uses `wire_api = "responses"`.
 - Changed the vLLM setup flow to ask for the base URL first, discover `/models`, ask for a manual model name only when discovery fails, and prompt for the API key last.
 - Fixed the systemd user service failing to start the proxy when `node` is not on systemd's default `PATH`.
 - Renamed the local proxy service to `agent-router-proxy.service` to avoid collisions with other projects.
