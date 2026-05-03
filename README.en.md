@@ -10,7 +10,16 @@ This project is not affiliated with Anthropic, OpenAI, MiniMax, DeepSeek, Moonsh
 
 Requirement: `curl`. If Node.js/npm is missing, the installer can install Node.js under the user directory without sudo.
 
-Review the script before running it:
+Recommended: download the script directly from GitHub, review it, then run it:
+
+```bash
+curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
+  https://raw.githubusercontent.com/herb711/agent-router/main/install.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
+If `raw.githubusercontent.com` is unstable on your network, use the jsDelivr Fastly mirror:
 
 ```bash
 curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
@@ -19,7 +28,14 @@ less install.sh
 bash install.sh
 ```
 
-One-line install:
+One-line install from GitHub raw:
+
+```bash
+curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
+  https://raw.githubusercontent.com/herb711/agent-router/main/install.sh | bash
+```
+
+If GitHub raw is unstable, use the mirror one-line install:
 
 ```bash
 curl -fL --connect-timeout 15 --max-time 120 --retry 3 \

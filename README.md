@@ -10,7 +10,16 @@ agent-router 是一个面向服务器和纯终端环境的 Claude Code / Codex C
 
 要求：`curl`。如果系统里没有 Node.js/npm，脚本会自动安装到用户目录，不需要 sudo。
 
-建议先下载并查看脚本：
+推荐先从 GitHub 下载脚本，查看后再执行：
+
+```bash
+curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
+  https://raw.githubusercontent.com/herb711/agent-router/main/install.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
+如果 `raw.githubusercontent.com` 访问不稳定，可以使用 jsDelivr Fastly 镜像：
 
 ```bash
 curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
@@ -19,7 +28,14 @@ less install.sh
 bash install.sh
 ```
 
-也可以一行安装：
+也可以使用 GitHub raw 一键安装：
+
+```bash
+curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
+  https://raw.githubusercontent.com/herb711/agent-router/main/install.sh | bash
+```
+
+如果 GitHub raw 访问不稳定，可以使用镜像一键安装：
 
 ```bash
 curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
