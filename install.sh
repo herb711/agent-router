@@ -4,17 +4,29 @@ set -euo pipefail
 APP_NAME="agent-router"
 CLAUDE_DIR="${HOME}/.claude"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
+CODEX_DIR="${HOME}/.codex"
+CODEX_CONFIG_FILE="${CODEX_DIR}/config.toml"
 PROXY_DIR="${HOME}/.local/share/agent-router-proxy"
 PROXY_BIN="${PROXY_DIR}/proxy.js"
 PROXY_ENV="${PROXY_DIR}/proxy.env"
+CODEX_ROUTER_DIR="${HOME}/.local/share/agent-router-codex"
+CODEX_ENV="${CODEX_ROUTER_DIR}/codex.env"
+CODEX_PROXY_DIR="${HOME}/.local/share/agent-router-codex-proxy"
+CODEX_PROXY_BIN="${CODEX_PROXY_DIR}/proxy.js"
+CODEX_PROXY_ENV="${CODEX_PROXY_DIR}/proxy.env"
 USER_BIN_DIR="${HOME}/.local/bin"
 NODE_ROOT="${HOME}/.local/share/agent-router-node"
 NODE_VERSION="${AGENT_ROUTER_NODE_VERSION:-20.18.1}"
 PROXY_LAUNCHER="${USER_BIN_DIR}/agent-router-proxy"
+CODEX_PROXY_LAUNCHER="${USER_BIN_DIR}/agent-router-codex-proxy"
+CODEX_TOKEN_HELPER="${USER_BIN_DIR}/agent-router-codex-token"
 SWITCHER_BIN="${USER_BIN_DIR}/ccr"
 SWITCHER_ALIAS="${USER_BIN_DIR}/agent-router"
+CLAUDE_SWITCHER_HELPER="${USER_BIN_DIR}/agent-router-claude-switcher"
+CODEX_SWITCHER_HELPER="${USER_BIN_DIR}/agent-router-codex-switcher"
 SERVICE_DIR="${HOME}/.config/systemd/user"
 SERVICE_FILE="${SERVICE_DIR}/agent-router-proxy.service"
+CODEX_SERVICE_FILE="${SERVICE_DIR}/agent-router-codex-proxy.service"
 
 say() {
   printf '%s\n' "$*"
@@ -267,12 +279,18 @@ normalize_openai_base_url() {
 
 discover_openai_models() {
   local base_url="$1"
+  local api_key="${2:-}"
   local models_url="${base_url%/}/models"
+  local curl_args=()
 
   need_cmd curl || return 1
   need_cmd node || return 1
 
-  curl -fsS --connect-timeout 5 --max-time 10 "$models_url" 2>/dev/null | node -e '
+  if [ -n "$api_key" ] && [ "$api_key" != "EMPTY" ]; then
+    curl_args=(-H "Authorization: Bearer ${api_key}")
+  fi
+
+  curl -fsS --connect-timeout 5 --max-time 10 "${curl_args[@]}" "$models_url" 2>/dev/null | node -e '
 const chunks = [];
 process.stdin.on("data", chunk => chunks.push(chunk));
 process.stdin.on("end", () => {
@@ -322,12 +340,13 @@ select_discovered_model_menu() {
 select_openai_model_from_base_url() {
   local base_url="$1"
   local fallback_model="${2:-}"
+  local api_key="${3:-}"
   local model_lines
   local models=()
   local model
 
   tty_say "Checking models from ${base_url%/}/models..."
-  if model_lines="$(discover_openai_models "$base_url")" && [ -n "$model_lines" ]; then
+  if model_lines="$(discover_openai_models "$base_url" "$api_key")" && [ -n "$model_lines" ]; then
     while IFS= read -r model; do
       [ -n "$model" ] && models+=("$model")
     done <<< "$model_lines"
@@ -431,6 +450,24 @@ install_claude_code() {
   fi
 }
 
+install_codex_cli() {
+  install_npm_if_needed
+
+  if need_cmd codex; then
+    say "Codex CLI already installed: $(command -v codex)"
+    codex --version || true
+    return
+  fi
+
+  say "Installing Codex CLI with npm..."
+  ensure_user_bin_dir
+  npm install -g --prefix "${HOME}/.local" @openai/codex
+
+  if ! need_cmd codex; then
+    die "Codex CLI installed, but codex was not found on PATH. Add ${USER_BIN_DIR} to PATH, then rerun this script."
+  fi
+}
+
 write_direct_settings() {
   local base_url="$1"
   local api_key="$2"
@@ -514,7 +551,7 @@ if (!['authorization', 'bearer', 'x-api-key'].includes(authHeader)) {
   process.exit(1);
 }
 
-if (!['anthropic', 'openai-chat'].includes(normalizedApiFormat)) {
+if (!['anthropic', 'openai-chat', 'responses-chat'].includes(normalizedApiFormat)) {
   console.error(`Unsupported UPSTREAM_API_FORMAT: ${apiFormat}`);
   process.exit(1);
 }
@@ -770,6 +807,337 @@ function openAIToAnthropic(payload, requestedModel) {
   };
 }
 
+function responseContentToText(content) {
+  if (content == null) {
+    return '';
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    if (typeof content.text === 'string') {
+      return content.text;
+    }
+    if (typeof content.output === 'string') {
+      return content.output;
+    }
+    return JSON.stringify(content);
+  }
+
+  return content
+    .map(part => {
+      if (!part) {
+        return '';
+      }
+      if (typeof part === 'string') {
+        return part;
+      }
+      if (typeof part.text === 'string') {
+        return part.text;
+      }
+      if (typeof part.output === 'string') {
+        return part.output;
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function responseArgumentsToString(args) {
+  if (args == null) {
+    return '{}';
+  }
+  if (typeof args === 'string') {
+    return args;
+  }
+  return JSON.stringify(args);
+}
+
+function responseInputItemToChat(item) {
+  if (!item) {
+    return [];
+  }
+  if (typeof item === 'string') {
+    return [{ role: 'user', content: item }];
+  }
+  if (item.type === 'function_call') {
+    const callId = item.call_id || item.id || `call_${Date.now()}`;
+    return [{
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: callId,
+        type: 'function',
+        function: {
+          name: item.name || 'tool',
+          arguments: responseArgumentsToString(item.arguments)
+        }
+      }]
+    }];
+  }
+  if (item.type === 'function_call_output') {
+    return [{
+      role: 'tool',
+      tool_call_id: item.call_id || item.id || `call_${Date.now()}`,
+      content: responseContentToText(item.output != null ? item.output : item.content)
+    }];
+  }
+  if (item.type === 'message' || item.role) {
+    return [{
+      role: item.role === 'assistant' ? 'assistant' : (item.role === 'system' ? 'system' : 'user'),
+      content: responseContentToText(item.content)
+    }];
+  }
+  return [{ role: 'user', content: responseContentToText(item) }];
+}
+
+function convertResponsesTool(tool) {
+  if (!tool || tool.type !== 'function' || !tool.name) {
+    return null;
+  }
+  return {
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description || '',
+      parameters: tool.parameters || { type: 'object', properties: {} }
+    }
+  };
+}
+
+function convertResponsesToolChoice(choice) {
+  if (!choice) {
+    return undefined;
+  }
+  if (typeof choice === 'string') {
+    if (choice === 'none' || choice === 'auto' || choice === 'required') {
+      return choice;
+    }
+    return undefined;
+  }
+  if (choice.type === 'function' && choice.name) {
+    return { type: 'function', function: { name: choice.name } };
+  }
+  if (choice.type === 'auto') {
+    return 'auto';
+  }
+  if (choice.type === 'none') {
+    return 'none';
+  }
+  return undefined;
+}
+
+function responsesToOpenAIChat(body) {
+  const messages = [];
+  const instructions = responseContentToText(body.instructions);
+  if (instructions) {
+    messages.push({ role: 'system', content: instructions });
+  }
+
+  if (typeof body.input === 'string') {
+    messages.push({ role: 'user', content: body.input });
+  } else if (Array.isArray(body.input)) {
+    for (const item of body.input) {
+      messages.push(...responseInputItemToChat(item));
+    }
+  } else if (body.input != null) {
+    messages.push({ role: 'user', content: responseContentToText(body.input) });
+  }
+
+  if (messages.length === 0) {
+    messages.push({ role: 'user', content: '' });
+  }
+
+  const openAIRequest = {
+    model: body.model,
+    messages,
+    stream: false
+  };
+
+  if (typeof body.max_output_tokens === 'number') {
+    openAIRequest.max_tokens = maxTokensLimit > 0 ? Math.min(body.max_output_tokens, maxTokensLimit) : body.max_output_tokens;
+  }
+  if (typeof body.temperature === 'number') {
+    openAIRequest.temperature = body.temperature;
+  }
+  if (typeof body.top_p === 'number') {
+    openAIRequest.top_p = body.top_p;
+  }
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const tools = body.tools.map(convertResponsesTool).filter(Boolean);
+    if (tools.length > 0) {
+      openAIRequest.tools = tools;
+      const toolChoice = convertResponsesToolChoice(body.tool_choice);
+      if (toolChoice) {
+        openAIRequest.tool_choice = toolChoice;
+      }
+    }
+  }
+
+  return openAIRequest;
+}
+
+function openAIChatToResponses(payload, requestedModel) {
+  const choice = (payload.choices || [])[0] || {};
+  const message = choice.message || {};
+  const responseId = payload.id && String(payload.id).startsWith('resp_') ? payload.id : `resp_${Date.now()}`;
+  const output = [];
+
+  if (message.content) {
+    output.push({
+      type: 'message',
+      id: `msg_${Date.now()}`,
+      status: 'completed',
+      role: 'assistant',
+      content: [{
+        type: 'output_text',
+        text: Array.isArray(message.content) ? responseContentToText(message.content) : String(message.content),
+        annotations: []
+      }]
+    });
+  }
+
+  for (const call of message.tool_calls || []) {
+    output.push({
+      type: 'function_call',
+      id: call.id || `fc_${output.length}`,
+      call_id: call.id || `call_${output.length}`,
+      name: (call.function && call.function.name) || 'tool',
+      arguments: (call.function && call.function.arguments) || '{}',
+      status: 'completed'
+    });
+  }
+
+  if (output.length === 0) {
+    output.push({
+      type: 'message',
+      id: `msg_${Date.now()}`,
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: '', annotations: [] }]
+    });
+  }
+
+  const inputTokens = (payload.usage && payload.usage.prompt_tokens) || 0;
+  const outputTokens = (payload.usage && payload.usage.completion_tokens) || 0;
+
+  return {
+    id: responseId,
+    object: 'response',
+    created_at: payload.created || Math.floor(Date.now() / 1000),
+    status: 'completed',
+    error: null,
+    incomplete_details: null,
+    model: payload.model || requestedModel,
+    output,
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: (payload.usage && payload.usage.total_tokens) || (inputTokens + outputTokens)
+    }
+  };
+}
+
+function sendResponseEvent(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function sendResponseStreamFromObject(res, response) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    'x-proxied-by': 'agent-router-proxy-server'
+  });
+
+  sendResponseEvent(res, 'response.created', {
+    type: 'response.created',
+    response: { ...response, status: 'in_progress', output: [] }
+  });
+  sendResponseEvent(res, 'response.in_progress', {
+    type: 'response.in_progress',
+    response: { ...response, status: 'in_progress', output: [] }
+  });
+
+  response.output.forEach((item, outputIndex) => {
+    if (item.type === 'message') {
+      const emptyItem = { ...item, content: [] };
+      const part = item.content && item.content[0] ? item.content[0] : { type: 'output_text', text: '', annotations: [] };
+      sendResponseEvent(res, 'response.output_item.added', {
+        type: 'response.output_item.added',
+        output_index: outputIndex,
+        item: emptyItem
+      });
+      sendResponseEvent(res, 'response.content_part.added', {
+        type: 'response.content_part.added',
+        output_index: outputIndex,
+        content_index: 0,
+        part: { ...part, text: '' }
+      });
+      if (part.text) {
+        sendResponseEvent(res, 'response.output_text.delta', {
+          type: 'response.output_text.delta',
+          output_index: outputIndex,
+          content_index: 0,
+          delta: part.text
+        });
+      }
+      sendResponseEvent(res, 'response.output_text.done', {
+        type: 'response.output_text.done',
+        output_index: outputIndex,
+        content_index: 0,
+        text: part.text || ''
+      });
+      sendResponseEvent(res, 'response.content_part.done', {
+        type: 'response.content_part.done',
+        output_index: outputIndex,
+        content_index: 0,
+        part
+      });
+      sendResponseEvent(res, 'response.output_item.done', {
+        type: 'response.output_item.done',
+        output_index: outputIndex,
+        item
+      });
+      return;
+    }
+
+    sendResponseEvent(res, 'response.output_item.added', {
+      type: 'response.output_item.added',
+      output_index: outputIndex,
+      item: { ...item, arguments: '' }
+    });
+    if (item.arguments) {
+      sendResponseEvent(res, 'response.function_call_arguments.delta', {
+        type: 'response.function_call_arguments.delta',
+        output_index: outputIndex,
+        delta: item.arguments
+      });
+    }
+    sendResponseEvent(res, 'response.function_call_arguments.done', {
+      type: 'response.function_call_arguments.done',
+      output_index: outputIndex,
+      arguments: item.arguments || '{}'
+    });
+    sendResponseEvent(res, 'response.output_item.done', {
+      type: 'response.output_item.done',
+      output_index: outputIndex,
+      item
+    });
+  });
+
+  sendResponseEvent(res, 'response.completed', {
+    type: 'response.completed',
+    response
+  });
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
 function sendSse(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -959,7 +1327,17 @@ const server = http.createServer((req, res) => {
   }
 
   const requestPath = req.url.split('?')[0];
-  if (req.method !== 'POST' || requestPath !== '/v1/messages') {
+  const isMessagesRequest = requestPath === '/v1/messages';
+  const isResponsesRequest = requestPath === '/v1/responses' || requestPath === '/responses';
+  if (req.method !== 'POST') {
+    sendJson(res, 404, { error: 'not found' });
+    return;
+  }
+  if (normalizedApiFormat === 'responses-chat' && !isResponsesRequest) {
+    sendJson(res, 404, { error: 'not found' });
+    return;
+  }
+  if (normalizedApiFormat !== 'responses-chat' && !isMessagesRequest) {
     sendJson(res, 404, { error: 'not found' });
     return;
   }
@@ -972,6 +1350,7 @@ const server = http.createServer((req, res) => {
     let targetPath = upstreamPath('/v1/messages');
     let requestedModel = provider;
     let openAIRequest = null;
+    let responsesRequest = null;
 
     if (normalizedApiFormat === 'openai-chat') {
       try {
@@ -982,6 +1361,17 @@ const server = http.createServer((req, res) => {
         targetPath = upstreamPath('/chat/completions');
       } catch (err) {
         sendJson(res, 400, { error: `invalid Anthropic request for OpenAI adapter: ${err.message}` });
+        return;
+      }
+    } else if (normalizedApiFormat === 'responses-chat') {
+      try {
+        responsesRequest = JSON.parse(body.toString('utf8'));
+        requestedModel = responsesRequest.model || requestedModel;
+        openAIRequest = responsesToOpenAIChat(responsesRequest);
+        outgoingBody = Buffer.from(JSON.stringify(openAIRequest));
+        targetPath = upstreamPath('/chat/completions');
+      } catch (err) {
+        sendJson(res, 400, { error: `invalid Responses request for Chat Completions adapter: ${err.message}` });
         return;
       }
     }
@@ -1000,7 +1390,7 @@ const server = http.createServer((req, res) => {
       }
     };
 
-    if (normalizedApiFormat === 'openai-chat') {
+    if (normalizedApiFormat === 'openai-chat' || normalizedApiFormat === 'responses-chat') {
       delete options.headers['anthropic-version'];
       delete options.headers['anthropic-beta'];
     }
@@ -1031,6 +1421,32 @@ const server = http.createServer((req, res) => {
             sendJson(res, proxyRes.statusCode || 200, openAIToAnthropic(payload, requestedModel));
           } catch (err) {
             sendJson(res, 502, { error: `failed to parse OpenAI-compatible response: ${err.message}` });
+          }
+        });
+        return;
+      }
+
+      if (normalizedApiFormat === 'responses-chat') {
+        const responseChunks = [];
+        proxyRes.on('data', chunk => responseChunks.push(chunk));
+        proxyRes.on('end', () => {
+          const rawResponse = Buffer.concat(responseChunks);
+          if ((proxyRes.statusCode || 500) >= 400) {
+            res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+            res.end(rawResponse);
+            return;
+          }
+
+          try {
+            const payload = JSON.parse(rawResponse.toString('utf8'));
+            const responseObject = openAIChatToResponses(payload, requestedModel);
+            if (responsesRequest && responsesRequest.stream) {
+              sendResponseStreamFromObject(res, responseObject);
+            } else {
+              sendJson(res, proxyRes.statusCode || 200, responseObject);
+            }
+          } catch (err) {
+            sendJson(res, 502, { error: `failed to parse Chat Completions response: ${err.message}` });
           }
         });
         return;
@@ -1112,10 +1528,272 @@ EOF_SERVICE
   say "Started user service: agent-router-proxy.service"
 }
 
+write_codex_proxy_files() {
+  local provider="$1"
+  local base_url="$2"
+  local api_key="$3"
+  local port="$4"
+  local auth_header="$5"
+  local api_format="${6:-responses-chat}"
+  local saved_proxy_dir="$PROXY_DIR"
+  local saved_proxy_bin="$PROXY_BIN"
+  local saved_proxy_env="$PROXY_ENV"
+  local saved_proxy_launcher="$PROXY_LAUNCHER"
+
+  PROXY_DIR="$CODEX_PROXY_DIR"
+  PROXY_BIN="$CODEX_PROXY_BIN"
+  PROXY_ENV="$CODEX_PROXY_ENV"
+  PROXY_LAUNCHER="$CODEX_PROXY_LAUNCHER"
+  write_proxy_files "$provider" "$base_url" "$api_key" "$port" "$auth_header" "$api_format"
+  PROXY_DIR="$saved_proxy_dir"
+  PROXY_BIN="$saved_proxy_bin"
+  PROXY_ENV="$saved_proxy_env"
+  PROXY_LAUNCHER="$saved_proxy_launcher"
+}
+
+write_codex_proxy_service() {
+  if ! need_cmd systemctl; then
+    say "systemctl not found; skipping Codex systemd user service."
+    return
+  fi
+
+  mkdir -p "$SERVICE_DIR"
+  cat > "$CODEX_SERVICE_FILE" <<EOF_SERVICE
+[Unit]
+Description=agent-router Responses adapter proxy for Codex
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${CODEX_PROXY_LAUNCHER}
+Restart=always
+RestartSec=5
+Environment=HOME=${HOME}
+Environment=PATH=${USER_BIN_DIR}:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+EOF_SERVICE
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now agent-router-codex-proxy.service
+  say "Started user service: agent-router-codex-proxy.service"
+}
+
+codex_config_root_value() {
+  local key="$1"
+  [ -f "$CODEX_CONFIG_FILE" ] || return 1
+  awk -v key="$key" '
+    /^[[:space:]]*\[/ { in_root = 0 }
+    BEGIN { in_root = 1 }
+    in_root && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      gsub(/^"|"$/, "")
+      print
+      exit
+    }
+  ' "$CODEX_CONFIG_FILE"
+}
+
+write_codex_auth_files() {
+  local api_key="$1"
+
+  mkdir -p "$CODEX_ROUTER_DIR" "$USER_BIN_DIR"
+  chmod 700 "$CODEX_ROUTER_DIR"
+
+  umask 077
+  cat > "$CODEX_ENV" <<EOF_CODEX_ENV
+CODEX_PROVIDER_API_KEY=${api_key}
+EOF_CODEX_ENV
+  chmod 600 "$CODEX_ENV"
+
+  cat > "$CODEX_TOKEN_HELPER" <<EOF_CODEX_TOKEN
+#!/usr/bin/env bash
+set -euo pipefail
+. "${CODEX_ENV}"
+printf '%s' "\${CODEX_PROVIDER_API_KEY}"
+EOF_CODEX_TOKEN
+  chmod 700 "$CODEX_TOKEN_HELPER"
+}
+
+write_codex_config() {
+  local base_url="$1"
+  local model="$2"
+  local provider_name="$3"
+  local reasoning_effort="${4:-high}"
+  local provider_id="agent-router-codex"
+
+  mkdir -p "$CODEX_DIR"
+  chmod 700 "$CODEX_DIR"
+  backup_if_exists "$CODEX_CONFIG_FILE"
+
+  CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
+  CODEX_PROVIDER_ID="$provider_id" \
+  CODEX_PROVIDER_NAME="$provider_name" \
+  CODEX_BASE_URL="$base_url" \
+  CODEX_MODEL="$model" \
+  CODEX_REASONING_EFFORT="$reasoning_effort" \
+  CODEX_TOKEN_HELPER="$CODEX_TOKEN_HELPER" \
+  node <<'EOF_CODEX_CONFIG'
+const fs = require('fs');
+
+const configFile = process.env.CODEX_CONFIG_FILE;
+const providerId = process.env.CODEX_PROVIDER_ID;
+const providerName = process.env.CODEX_PROVIDER_NAME;
+const baseUrl = process.env.CODEX_BASE_URL;
+const model = process.env.CODEX_MODEL;
+const reasoningEffort = process.env.CODEX_REASONING_EFFORT;
+const tokenHelper = process.env.CODEX_TOKEN_HELPER;
+
+function tomlString(value) {
+  return JSON.stringify(String(value));
+}
+
+let text = '';
+if (fs.existsSync(configFile)) {
+  text = fs.readFileSync(configFile, 'utf8');
+}
+
+const lines = text.split(/\r?\n/);
+const kept = [];
+let section = '';
+let skippingProvider = false;
+
+for (const line of lines) {
+  const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
+  if (header) {
+    section = header[1].trim();
+    skippingProvider = section === `model_providers.${providerId}` ||
+      section.startsWith(`model_providers.${providerId}.`);
+    if (skippingProvider) {
+      continue;
+    }
+  }
+  if (skippingProvider) {
+    continue;
+  }
+  if (!section && /^\s*(model|model_provider|model_reasoning_effort)\s*=/.test(line)) {
+    continue;
+  }
+  kept.push(line);
+}
+
+while (kept.length > 0 && kept[0].trim() === '') {
+  kept.shift();
+}
+
+const header = [
+  `model = ${tomlString(model)}`,
+  `model_provider = ${tomlString(providerId)}`,
+  reasoningEffort ? `model_reasoning_effort = ${tomlString(reasoningEffort)}` : null,
+  '',
+  `[model_providers.${providerId}]`,
+  `name = ${tomlString(providerName)}`,
+  `base_url = ${tomlString(baseUrl)}`,
+  `wire_api = "responses"`,
+  `request_max_retries = 4`,
+  `stream_max_retries = 5`,
+  `stream_idle_timeout_ms = 300000`,
+  '',
+  `[model_providers.${providerId}.auth]`,
+  `command = ${tomlString(tokenHelper)}`,
+  ''
+].filter(line => line !== null);
+
+const nextText = `${header.join('\n')}${kept.length ? `\n${kept.join('\n')}` : ''}`.replace(/\s+$/, '') + '\n';
+fs.writeFileSync(configFile, nextText, { mode: 0o600 });
+EOF_CODEX_CONFIG
+
+  chmod 600 "$CODEX_CONFIG_FILE"
+  say "Wrote Codex config: $CODEX_CONFIG_FILE"
+}
+
+configure_codex_provider() {
+  local default_model="${1:-gpt-5.5}"
+  local existing_model
+  existing_model="$(codex_config_root_value model || true)"
+  [ -n "$existing_model" ] && default_model="$existing_model"
+
+  say "Choose Codex upstream protocol:"
+  say "  1) Responses API (OpenAI or compatible). Recommended for current Codex."
+  say "  2) Chat Completions API (use local Responses adapter for older compatible services)."
+  local protocol_choice
+  protocol_choice="$(prompt_default 'Protocol choice' '1')"
+
+  local api_format="responses"
+  local base_url
+  local default_base_url
+  local provider_name
+  case "$protocol_choice" in
+    2)
+      api_format="responses-chat"
+      default_base_url="http://127.0.0.1:8000/v1"
+      provider_name="Agent Router Chat Completions Adapter"
+      base_url="$(normalize_openai_base_url "$(prompt_default 'Chat Completions-compatible base URL' "$default_base_url")")"
+      say "Codex will call the local Responses API adapter; upstream Chat Completions endpoint: ${base_url}"
+      ;;
+    *)
+      default_base_url="https://api.openai.com/v1"
+      provider_name="Agent Router Responses API"
+      base_url="$(normalize_openai_base_url "$(prompt_default 'Responses-compatible base URL' "$default_base_url")")"
+      say "Codex Responses endpoint: ${base_url}"
+      ;;
+  esac
+
+  local api_key
+  if [ "$api_format" = "responses-chat" ]; then
+    say "API Key input is hidden. Leave empty to use EMPTY for a local server without auth."
+    api_key="$(prompt_secret 'API Key')"
+    api_key="${api_key:-EMPTY}"
+  else
+    say "API Key input is hidden. Paste the key, then press Enter."
+    api_key="$(prompt_required_secret 'API Key')"
+  fi
+
+  local model
+  model="$(select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
+
+  local reasoning_effort
+  reasoning_effort="$(prompt_default 'Codex reasoning effort' 'high')"
+
+  write_codex_auth_files "$api_key"
+
+  if [ "$api_format" = "responses-chat" ]; then
+    say
+    say "Codex uses Responses API. This upstream uses Chat Completions, so the local adapter proxy is required."
+    local port
+    port="$(prompt_default 'Local proxy port' '8081')"
+    write_codex_proxy_files "codex" "$base_url" "$api_key" "$port" "authorization" "$api_format"
+    write_codex_config "http://127.0.0.1:${port}/v1" "$model" "$provider_name" "$reasoning_effort"
+
+    if confirm 'Start proxy as a systemd user service now?' 'Y'; then
+      write_codex_proxy_service
+    else
+      say "Proxy can be started manually with: $CODEX_PROXY_LAUNCHER"
+    fi
+  else
+    write_codex_config "$base_url" "$model" "$provider_name" "$reasoning_effort"
+  fi
+}
+
+remove_legacy_codex_switchers() {
+  local file
+
+  for file in "${USER_BIN_DIR}/cxr" "${USER_BIN_DIR}/codex-router"; do
+    [ -e "$file" ] || [ -L "$file" ] || continue
+    if [ -L "$file" ]; then
+      rm -f "$file"
+    elif grep -q 'agent-router-codex\|agent-router Codex provider switcher' "$file" 2>/dev/null; then
+      rm -f "$file"
+    fi
+  done
+}
+
 write_switcher_command() {
   mkdir -p "$USER_BIN_DIR"
 
-  cat > "$SWITCHER_BIN" <<'EOF_SWITCHER'
+  cat > "$CLAUDE_SWITCHER_HELPER" <<'EOF_SWITCHER'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -1574,7 +2252,7 @@ if (!['authorization', 'bearer', 'x-api-key'].includes(authHeader)) {
   process.exit(1);
 }
 
-if (!['anthropic', 'openai-chat'].includes(normalizedApiFormat)) {
+if (!['anthropic', 'openai-chat', 'responses-chat'].includes(normalizedApiFormat)) {
   console.error(`Unsupported UPSTREAM_API_FORMAT: ${apiFormat}`);
   process.exit(1);
 }
@@ -1830,6 +2508,337 @@ function openAIToAnthropic(payload, requestedModel) {
   };
 }
 
+function responseContentToText(content) {
+  if (content == null) {
+    return '';
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    if (typeof content.text === 'string') {
+      return content.text;
+    }
+    if (typeof content.output === 'string') {
+      return content.output;
+    }
+    return JSON.stringify(content);
+  }
+
+  return content
+    .map(part => {
+      if (!part) {
+        return '';
+      }
+      if (typeof part === 'string') {
+        return part;
+      }
+      if (typeof part.text === 'string') {
+        return part.text;
+      }
+      if (typeof part.output === 'string') {
+        return part.output;
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function responseArgumentsToString(args) {
+  if (args == null) {
+    return '{}';
+  }
+  if (typeof args === 'string') {
+    return args;
+  }
+  return JSON.stringify(args);
+}
+
+function responseInputItemToChat(item) {
+  if (!item) {
+    return [];
+  }
+  if (typeof item === 'string') {
+    return [{ role: 'user', content: item }];
+  }
+  if (item.type === 'function_call') {
+    const callId = item.call_id || item.id || `call_${Date.now()}`;
+    return [{
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: callId,
+        type: 'function',
+        function: {
+          name: item.name || 'tool',
+          arguments: responseArgumentsToString(item.arguments)
+        }
+      }]
+    }];
+  }
+  if (item.type === 'function_call_output') {
+    return [{
+      role: 'tool',
+      tool_call_id: item.call_id || item.id || `call_${Date.now()}`,
+      content: responseContentToText(item.output != null ? item.output : item.content)
+    }];
+  }
+  if (item.type === 'message' || item.role) {
+    return [{
+      role: item.role === 'assistant' ? 'assistant' : (item.role === 'system' ? 'system' : 'user'),
+      content: responseContentToText(item.content)
+    }];
+  }
+  return [{ role: 'user', content: responseContentToText(item) }];
+}
+
+function convertResponsesTool(tool) {
+  if (!tool || tool.type !== 'function' || !tool.name) {
+    return null;
+  }
+  return {
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description || '',
+      parameters: tool.parameters || { type: 'object', properties: {} }
+    }
+  };
+}
+
+function convertResponsesToolChoice(choice) {
+  if (!choice) {
+    return undefined;
+  }
+  if (typeof choice === 'string') {
+    if (choice === 'none' || choice === 'auto' || choice === 'required') {
+      return choice;
+    }
+    return undefined;
+  }
+  if (choice.type === 'function' && choice.name) {
+    return { type: 'function', function: { name: choice.name } };
+  }
+  if (choice.type === 'auto') {
+    return 'auto';
+  }
+  if (choice.type === 'none') {
+    return 'none';
+  }
+  return undefined;
+}
+
+function responsesToOpenAIChat(body) {
+  const messages = [];
+  const instructions = responseContentToText(body.instructions);
+  if (instructions) {
+    messages.push({ role: 'system', content: instructions });
+  }
+
+  if (typeof body.input === 'string') {
+    messages.push({ role: 'user', content: body.input });
+  } else if (Array.isArray(body.input)) {
+    for (const item of body.input) {
+      messages.push(...responseInputItemToChat(item));
+    }
+  } else if (body.input != null) {
+    messages.push({ role: 'user', content: responseContentToText(body.input) });
+  }
+
+  if (messages.length === 0) {
+    messages.push({ role: 'user', content: '' });
+  }
+
+  const openAIRequest = {
+    model: body.model,
+    messages,
+    stream: false
+  };
+
+  if (typeof body.max_output_tokens === 'number') {
+    openAIRequest.max_tokens = maxTokensLimit > 0 ? Math.min(body.max_output_tokens, maxTokensLimit) : body.max_output_tokens;
+  }
+  if (typeof body.temperature === 'number') {
+    openAIRequest.temperature = body.temperature;
+  }
+  if (typeof body.top_p === 'number') {
+    openAIRequest.top_p = body.top_p;
+  }
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const tools = body.tools.map(convertResponsesTool).filter(Boolean);
+    if (tools.length > 0) {
+      openAIRequest.tools = tools;
+      const toolChoice = convertResponsesToolChoice(body.tool_choice);
+      if (toolChoice) {
+        openAIRequest.tool_choice = toolChoice;
+      }
+    }
+  }
+
+  return openAIRequest;
+}
+
+function openAIChatToResponses(payload, requestedModel) {
+  const choice = (payload.choices || [])[0] || {};
+  const message = choice.message || {};
+  const responseId = payload.id && String(payload.id).startsWith('resp_') ? payload.id : `resp_${Date.now()}`;
+  const output = [];
+
+  if (message.content) {
+    output.push({
+      type: 'message',
+      id: `msg_${Date.now()}`,
+      status: 'completed',
+      role: 'assistant',
+      content: [{
+        type: 'output_text',
+        text: Array.isArray(message.content) ? responseContentToText(message.content) : String(message.content),
+        annotations: []
+      }]
+    });
+  }
+
+  for (const call of message.tool_calls || []) {
+    output.push({
+      type: 'function_call',
+      id: call.id || `fc_${output.length}`,
+      call_id: call.id || `call_${output.length}`,
+      name: (call.function && call.function.name) || 'tool',
+      arguments: (call.function && call.function.arguments) || '{}',
+      status: 'completed'
+    });
+  }
+
+  if (output.length === 0) {
+    output.push({
+      type: 'message',
+      id: `msg_${Date.now()}`,
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: '', annotations: [] }]
+    });
+  }
+
+  const inputTokens = (payload.usage && payload.usage.prompt_tokens) || 0;
+  const outputTokens = (payload.usage && payload.usage.completion_tokens) || 0;
+
+  return {
+    id: responseId,
+    object: 'response',
+    created_at: payload.created || Math.floor(Date.now() / 1000),
+    status: 'completed',
+    error: null,
+    incomplete_details: null,
+    model: payload.model || requestedModel,
+    output,
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: (payload.usage && payload.usage.total_tokens) || (inputTokens + outputTokens)
+    }
+  };
+}
+
+function sendResponseEvent(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function sendResponseStreamFromObject(res, response) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    'x-proxied-by': 'agent-router-proxy-server'
+  });
+
+  sendResponseEvent(res, 'response.created', {
+    type: 'response.created',
+    response: { ...response, status: 'in_progress', output: [] }
+  });
+  sendResponseEvent(res, 'response.in_progress', {
+    type: 'response.in_progress',
+    response: { ...response, status: 'in_progress', output: [] }
+  });
+
+  response.output.forEach((item, outputIndex) => {
+    if (item.type === 'message') {
+      const emptyItem = { ...item, content: [] };
+      const part = item.content && item.content[0] ? item.content[0] : { type: 'output_text', text: '', annotations: [] };
+      sendResponseEvent(res, 'response.output_item.added', {
+        type: 'response.output_item.added',
+        output_index: outputIndex,
+        item: emptyItem
+      });
+      sendResponseEvent(res, 'response.content_part.added', {
+        type: 'response.content_part.added',
+        output_index: outputIndex,
+        content_index: 0,
+        part: { ...part, text: '' }
+      });
+      if (part.text) {
+        sendResponseEvent(res, 'response.output_text.delta', {
+          type: 'response.output_text.delta',
+          output_index: outputIndex,
+          content_index: 0,
+          delta: part.text
+        });
+      }
+      sendResponseEvent(res, 'response.output_text.done', {
+        type: 'response.output_text.done',
+        output_index: outputIndex,
+        content_index: 0,
+        text: part.text || ''
+      });
+      sendResponseEvent(res, 'response.content_part.done', {
+        type: 'response.content_part.done',
+        output_index: outputIndex,
+        content_index: 0,
+        part
+      });
+      sendResponseEvent(res, 'response.output_item.done', {
+        type: 'response.output_item.done',
+        output_index: outputIndex,
+        item
+      });
+      return;
+    }
+
+    sendResponseEvent(res, 'response.output_item.added', {
+      type: 'response.output_item.added',
+      output_index: outputIndex,
+      item: { ...item, arguments: '' }
+    });
+    if (item.arguments) {
+      sendResponseEvent(res, 'response.function_call_arguments.delta', {
+        type: 'response.function_call_arguments.delta',
+        output_index: outputIndex,
+        delta: item.arguments
+      });
+    }
+    sendResponseEvent(res, 'response.function_call_arguments.done', {
+      type: 'response.function_call_arguments.done',
+      output_index: outputIndex,
+      arguments: item.arguments || '{}'
+    });
+    sendResponseEvent(res, 'response.output_item.done', {
+      type: 'response.output_item.done',
+      output_index: outputIndex,
+      item
+    });
+  });
+
+  sendResponseEvent(res, 'response.completed', {
+    type: 'response.completed',
+    response
+  });
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
 function sendSse(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -2019,7 +3028,17 @@ const server = http.createServer((req, res) => {
   }
 
   const requestPath = req.url.split('?')[0];
-  if (req.method !== 'POST' || requestPath !== '/v1/messages') {
+  const isMessagesRequest = requestPath === '/v1/messages';
+  const isResponsesRequest = requestPath === '/v1/responses' || requestPath === '/responses';
+  if (req.method !== 'POST') {
+    sendJson(res, 404, { error: 'not found' });
+    return;
+  }
+  if (normalizedApiFormat === 'responses-chat' && !isResponsesRequest) {
+    sendJson(res, 404, { error: 'not found' });
+    return;
+  }
+  if (normalizedApiFormat !== 'responses-chat' && !isMessagesRequest) {
     sendJson(res, 404, { error: 'not found' });
     return;
   }
@@ -2032,6 +3051,7 @@ const server = http.createServer((req, res) => {
     let targetPath = upstreamPath('/v1/messages');
     let requestedModel = provider;
     let openAIRequest = null;
+    let responsesRequest = null;
 
     if (normalizedApiFormat === 'openai-chat') {
       try {
@@ -2042,6 +3062,17 @@ const server = http.createServer((req, res) => {
         targetPath = upstreamPath('/chat/completions');
       } catch (err) {
         sendJson(res, 400, { error: `invalid Anthropic request for OpenAI adapter: ${err.message}` });
+        return;
+      }
+    } else if (normalizedApiFormat === 'responses-chat') {
+      try {
+        responsesRequest = JSON.parse(body.toString('utf8'));
+        requestedModel = responsesRequest.model || requestedModel;
+        openAIRequest = responsesToOpenAIChat(responsesRequest);
+        outgoingBody = Buffer.from(JSON.stringify(openAIRequest));
+        targetPath = upstreamPath('/chat/completions');
+      } catch (err) {
+        sendJson(res, 400, { error: `invalid Responses request for Chat Completions adapter: ${err.message}` });
         return;
       }
     }
@@ -2060,7 +3091,7 @@ const server = http.createServer((req, res) => {
       }
     };
 
-    if (normalizedApiFormat === 'openai-chat') {
+    if (normalizedApiFormat === 'openai-chat' || normalizedApiFormat === 'responses-chat') {
       delete options.headers['anthropic-version'];
       delete options.headers['anthropic-beta'];
     }
@@ -2091,6 +3122,32 @@ const server = http.createServer((req, res) => {
             sendJson(res, proxyRes.statusCode || 200, openAIToAnthropic(payload, requestedModel));
           } catch (err) {
             sendJson(res, 502, { error: `failed to parse OpenAI-compatible response: ${err.message}` });
+          }
+        });
+        return;
+      }
+
+      if (normalizedApiFormat === 'responses-chat') {
+        const responseChunks = [];
+        proxyRes.on('data', chunk => responseChunks.push(chunk));
+        proxyRes.on('end', () => {
+          const rawResponse = Buffer.concat(responseChunks);
+          if ((proxyRes.statusCode || 500) >= 400) {
+            res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+            res.end(rawResponse);
+            return;
+          }
+
+          try {
+            const payload = JSON.parse(rawResponse.toString('utf8'));
+            const responseObject = openAIChatToResponses(payload, requestedModel);
+            if (responsesRequest && responsesRequest.stream) {
+              sendResponseStreamFromObject(res, responseObject);
+            } else {
+              sendJson(res, proxyRes.statusCode || 200, responseObject);
+            }
+          } catch (err) {
+            sendJson(res, 502, { error: `failed to parse Chat Completions response: ${err.message}` });
           }
         });
         return;
@@ -2338,13 +3395,557 @@ main() {
 main "$@"
 EOF_SWITCHER
 
-  chmod 700 "$SWITCHER_BIN"
-  ln -sf "$SWITCHER_BIN" "$SWITCHER_ALIAS"
-  say "Installed provider switcher: $SWITCHER_BIN"
-  say "Also available as: $SWITCHER_ALIAS"
+  chmod 700 "$CLAUDE_SWITCHER_HELPER"
+  write_codex_switcher_command
+
+  cat > "$SWITCHER_BIN" <<EOF_UNIFIED_SWITCHER
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLAUDE_SWITCHER_HELPER="${CLAUDE_SWITCHER_HELPER}"
+CODEX_SWITCHER_HELPER="${CODEX_SWITCHER_HELPER}"
+
+say() {
+  printf '%s\n' "\$*"
+}
+
+die() {
+  printf 'Error: %s\n' "\$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "\$1" >/dev/null 2>&1
+}
+
+read_from_tty() {
+  local prompt="\$1"
+  local value
+  [ -r /dev/tty ] || die "interactive input requires a TTY. Run this command from a terminal."
+  printf '%s' "\$prompt" >/dev/tty
+  IFS= read -r value </dev/tty || die "failed to read input from terminal."
+  value="\$(printf '%s' "\$value" | LC_ALL=C tr -d '\000-\037\177')"
+  printf '%s' "\$value"
+}
+
+prompt_default() {
+  local prompt="\$1"
+  local default="\$2"
+  local value
+  value="\$(read_from_tty "\${prompt} [\${default}]: ")"
+  printf '%s' "\${value:-\$default}"
+}
+
+run_claude() {
+  [ -x "\$CLAUDE_SWITCHER_HELPER" ] || die "Claude Code switcher helper is missing: \$CLAUDE_SWITCHER_HELPER"
+  exec "\$CLAUDE_SWITCHER_HELPER" "\$@"
+}
+
+run_codex() {
+  [ -x "\$CODEX_SWITCHER_HELPER" ] || die "Codex switcher helper is missing: \$CODEX_SWITCHER_HELPER"
+  exec "\$CODEX_SWITCHER_HELPER" "\$@"
 }
 
 main() {
+  local has_claude=0
+  local has_codex=0
+
+  need_cmd claude && has_claude=1
+  need_cmd codex && has_codex=1
+
+  if [ "\$has_claude" = "1" ] && [ "\$has_codex" = "0" ]; then
+    run_claude "\$@"
+  fi
+
+  if [ "\$has_claude" = "0" ] && [ "\$has_codex" = "1" ]; then
+    run_codex "\$@"
+  fi
+
+  if [ "\$has_claude" = "0" ] && [ "\$has_codex" = "0" ]; then
+    die "Neither Claude Code nor Codex CLI was found on PATH."
+  fi
+
+  say "Choose tool to configure:"
+  say "  1) Claude Code"
+  say "  2) Codex CLI"
+  local tool_choice
+  tool_choice="\$(prompt_default 'Tool choice' '1')"
+  case "\$tool_choice" in
+    2) run_codex "\$@" ;;
+    *) run_claude "\$@" ;;
+  esac
+}
+
+main "\$@"
+EOF_UNIFIED_SWITCHER
+
+  chmod 700 "$SWITCHER_BIN"
+  ln -sf "$SWITCHER_BIN" "$SWITCHER_ALIAS"
+  remove_legacy_codex_switchers
+  say "Installed unified provider switcher: $SWITCHER_BIN"
+  say "Also available as: $SWITCHER_ALIAS"
+}
+
+write_codex_switcher_command() {
+  mkdir -p "$USER_BIN_DIR"
+
+  cat > "$CODEX_SWITCHER_HELPER" <<'EOF_CODEX_SWITCHER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CODEX_DIR="${HOME}/.codex"
+CODEX_CONFIG_FILE="${CODEX_DIR}/config.toml"
+CODEX_ROUTER_DIR="${HOME}/.local/share/agent-router-codex"
+CODEX_ENV="${CODEX_ROUTER_DIR}/codex.env"
+USER_BIN_DIR="${HOME}/.local/bin"
+CODEX_TOKEN_HELPER="${USER_BIN_DIR}/agent-router-codex-token"
+CODEX_PROXY_DIR="${HOME}/.local/share/agent-router-codex-proxy"
+CODEX_PROXY_BIN="${CODEX_PROXY_DIR}/proxy.js"
+CODEX_PROXY_ENV="${CODEX_PROXY_DIR}/proxy.env"
+CODEX_PROXY_LAUNCHER="${USER_BIN_DIR}/agent-router-codex-proxy"
+CODEX_SERVICE_FILE="${HOME}/.config/systemd/user/agent-router-codex-proxy.service"
+
+say() {
+  printf '%s\n' "$*"
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+read_from_tty() {
+  local prompt="$1"
+  local silent="${2:-0}"
+  local value
+
+  [ -r /dev/tty ] || die "interactive input requires a TTY. Run this command from a terminal."
+
+  printf '%s' "$prompt" >/dev/tty
+  if [ "$silent" = "1" ]; then
+    IFS= read -r -s value </dev/tty || die "failed to read input from terminal."
+    printf '\n' >/dev/tty
+  else
+    IFS= read -r value </dev/tty || die "failed to read input from terminal."
+  fi
+
+  value="$(printf '%s' "$value" | LC_ALL=C tr -d '\000-\037\177')"
+  printf '%s' "$value"
+}
+
+prompt_default() {
+  local prompt="$1"
+  local default="$2"
+  local value
+  value="$(read_from_tty "${prompt} [${default}]: ")"
+  printf '%s' "${value:-$default}"
+}
+
+prompt_secret() {
+  local prompt="$1"
+  local value
+  value="$(read_from_tty "${prompt}: " 1)"
+  printf '%s' "$value"
+}
+
+prompt_required_secret() {
+  local prompt="$1"
+  local value
+
+  while true; do
+    value="$(prompt_secret "$prompt")"
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+    printf '%s\n' "Input was empty. Paste your key, then press Enter. The key will not be shown while typing." >/dev/tty
+  done
+}
+
+prompt_required() {
+  local prompt="$1"
+  local value
+
+  while true; do
+    value="$(read_from_tty "${prompt}: ")"
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+    printf '%s\n' "Input was empty. Enter a value, then press Enter." >/dev/tty
+  done
+}
+
+tty_say() {
+  printf '%s\n' "$*" >/dev/tty
+}
+
+confirm() {
+  local prompt="$1"
+  local default="${2:-Y}"
+  local suffix="[Y/n]"
+  local answer
+  if [ "$default" = "N" ]; then
+    suffix="[y/N]"
+  fi
+  answer="$(read_from_tty "${prompt} ${suffix}: ")"
+  answer="${answer:-$default}"
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+backup_if_exists() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    local backup="${file}.backup.$(date +%s)"
+    cp "$file" "$backup"
+    say "Backed up existing file: $backup"
+  fi
+}
+
+normalize_openai_base_url() {
+  local base_url="${1:-http://127.0.0.1:8000/v1}"
+  base_url="${base_url%/}"
+  case "$base_url" in
+    */v1) printf '%s' "$base_url" ;;
+    *) printf '%s' "${base_url}/v1" ;;
+  esac
+}
+
+discover_openai_models() {
+  local base_url="$1"
+  local api_key="${2:-}"
+  local models_url="${base_url%/}/models"
+  local curl_args=()
+
+  need_cmd curl || return 1
+  need_cmd node || return 1
+
+  if [ -n "$api_key" ] && [ "$api_key" != "EMPTY" ]; then
+    curl_args=(-H "Authorization: Bearer ${api_key}")
+  fi
+
+  curl -fsS --connect-timeout 5 --max-time 10 "${curl_args[@]}" "$models_url" 2>/dev/null | node -e '
+const chunks = [];
+process.stdin.on("data", chunk => chunks.push(chunk));
+process.stdin.on("end", () => {
+  const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  const models = Array.isArray(payload.data) ? payload.data : [];
+  for (const model of models) {
+    if (model && typeof model.id === "string" && model.id.length > 0) {
+      console.log(model.id);
+    }
+  }
+});
+' 2>/dev/null
+}
+
+select_discovered_model_menu() {
+  local prompt="$1"
+  shift
+  local models=("$@")
+  local i
+  local choice
+  local custom_choice
+  local default_choice=1
+
+  custom_choice=$((${#models[@]} + 1))
+
+  tty_say "$prompt:"
+  for i in "${!models[@]}"; do
+    tty_say "  $((i + 1))) ${models[$i]}"
+  done
+  tty_say "  ${custom_choice}) Custom model name"
+
+  choice="$(prompt_default 'Model choice' "$default_choice")"
+  if [[ "$choice" =~ ^[0-9]+$ ]]; then
+    if [ "$choice" -ge 1 ] && [ "$choice" -le "${#models[@]}" ]; then
+      printf '%s' "${models[$((choice - 1))]}"
+      return
+    fi
+    if [ "$choice" -eq "$custom_choice" ]; then
+      printf '%s' "$(prompt_required 'Custom model name')"
+      return
+    fi
+  fi
+
+  printf '%s' "$choice"
+}
+
+select_openai_model_from_base_url() {
+  local base_url="$1"
+  local fallback_model="${2:-}"
+  local api_key="${3:-}"
+  local model_lines
+  local models=()
+  local model
+
+  tty_say "Checking models from ${base_url%/}/models..."
+  if model_lines="$(discover_openai_models "$base_url" "$api_key")" && [ -n "$model_lines" ]; then
+    while IFS= read -r model; do
+      [ -n "$model" ] && models+=("$model")
+    done <<< "$model_lines"
+
+    if [ "${#models[@]}" -gt 0 ]; then
+      select_discovered_model_menu "Discovered models" "${models[@]}"
+      return
+    fi
+  fi
+
+  tty_say "Could not discover models from ${base_url%/}/models."
+  if [ -n "$fallback_model" ]; then
+    printf '%s' "$(prompt_default 'Model name' "$fallback_model")"
+  else
+    printf '%s' "$(prompt_required 'Model name')"
+  fi
+}
+
+codex_config_root_value() {
+  local key="$1"
+  [ -f "$CODEX_CONFIG_FILE" ] || return 1
+  awk -v key="$key" '
+    /^[[:space:]]*\[/ { in_root = 0 }
+    BEGIN { in_root = 1 }
+    in_root && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      gsub(/^"|"$/, "")
+      print
+      exit
+    }
+  ' "$CODEX_CONFIG_FILE"
+}
+
+write_codex_auth_files() {
+  local api_key="$1"
+
+  mkdir -p "$CODEX_ROUTER_DIR" "$USER_BIN_DIR"
+  chmod 700 "$CODEX_ROUTER_DIR"
+
+  umask 077
+  cat > "$CODEX_ENV" <<EOF_CODEX_ENV
+CODEX_PROVIDER_API_KEY=${api_key}
+EOF_CODEX_ENV
+  chmod 600 "$CODEX_ENV"
+
+  cat > "$CODEX_TOKEN_HELPER" <<EOF_CODEX_TOKEN
+#!/usr/bin/env bash
+set -euo pipefail
+. "${CODEX_ENV}"
+printf '%s' "\${CODEX_PROVIDER_API_KEY}"
+EOF_CODEX_TOKEN
+  chmod 700 "$CODEX_TOKEN_HELPER"
+}
+
+write_codex_config() {
+  local base_url="$1"
+  local model="$2"
+  local provider_name="$3"
+  local reasoning_effort="${4:-high}"
+  local provider_id="agent-router-codex"
+
+  need_cmd node || die "node is required to update ${CODEX_CONFIG_FILE}."
+  mkdir -p "$CODEX_DIR"
+  chmod 700 "$CODEX_DIR"
+  backup_if_exists "$CODEX_CONFIG_FILE"
+
+  CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
+  CODEX_PROVIDER_ID="$provider_id" \
+  CODEX_PROVIDER_NAME="$provider_name" \
+  CODEX_BASE_URL="$base_url" \
+  CODEX_MODEL="$model" \
+  CODEX_REASONING_EFFORT="$reasoning_effort" \
+  CODEX_TOKEN_HELPER="$CODEX_TOKEN_HELPER" \
+  node <<'EOF_CODEX_CONFIG'
+const fs = require('fs');
+const configFile = process.env.CODEX_CONFIG_FILE;
+const providerId = process.env.CODEX_PROVIDER_ID;
+const providerName = process.env.CODEX_PROVIDER_NAME;
+const baseUrl = process.env.CODEX_BASE_URL;
+const model = process.env.CODEX_MODEL;
+const reasoningEffort = process.env.CODEX_REASONING_EFFORT;
+const tokenHelper = process.env.CODEX_TOKEN_HELPER;
+const tomlString = value => JSON.stringify(String(value));
+let text = fs.existsSync(configFile) ? fs.readFileSync(configFile, 'utf8') : '';
+const lines = text.split(/\r?\n/);
+const kept = [];
+let section = '';
+let skippingProvider = false;
+for (const line of lines) {
+  const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
+  if (header) {
+    section = header[1].trim();
+    skippingProvider = section === `model_providers.${providerId}` ||
+      section.startsWith(`model_providers.${providerId}.`);
+    if (skippingProvider) {
+      continue;
+    }
+  }
+  if (skippingProvider) {
+    continue;
+  }
+  if (!section && /^\s*(model|model_provider|model_reasoning_effort)\s*=/.test(line)) {
+    continue;
+  }
+  kept.push(line);
+}
+while (kept.length > 0 && kept[0].trim() === '') {
+  kept.shift();
+}
+const header = [
+  `model = ${tomlString(model)}`,
+  `model_provider = ${tomlString(providerId)}`,
+  reasoningEffort ? `model_reasoning_effort = ${tomlString(reasoningEffort)}` : null,
+  '',
+  `[model_providers.${providerId}]`,
+  `name = ${tomlString(providerName)}`,
+  `base_url = ${tomlString(baseUrl)}`,
+  `wire_api = "responses"`,
+  `request_max_retries = 4`,
+  `stream_max_retries = 5`,
+  `stream_idle_timeout_ms = 300000`,
+  '',
+  `[model_providers.${providerId}.auth]`,
+  `command = ${tomlString(tokenHelper)}`,
+  ''
+].filter(line => line !== null);
+const nextText = `${header.join('\n')}${kept.length ? `\n${kept.join('\n')}` : ''}`.replace(/\s+$/, '') + '\n';
+fs.writeFileSync(configFile, nextText, { mode: 0o600 });
+EOF_CODEX_CONFIG
+  chmod 600 "$CODEX_CONFIG_FILE"
+  say "Wrote Codex config: $CODEX_CONFIG_FILE"
+}
+
+write_proxy_env_for_codex_chat() {
+  local base_url="$1"
+  local api_key="$2"
+  local port="$3"
+
+  [ -f "$CODEX_PROXY_BIN" ] || die "Codex local proxy script is missing. Run install.sh once and choose Codex Chat Completions adapter to install it."
+  mkdir -p "$CODEX_PROXY_DIR" "$USER_BIN_DIR"
+  chmod 700 "$CODEX_PROXY_DIR"
+
+  umask 077
+  cat > "$CODEX_PROXY_ENV" <<EOF_ENV
+AGENT_ROUTER_PROVIDER=codex
+UPSTREAM_BASE_URL=${base_url}
+UPSTREAM_API_KEY=${api_key}
+UPSTREAM_AUTH_HEADER=authorization
+UPSTREAM_API_FORMAT=responses-chat
+PORT=${port}
+EOF_ENV
+  chmod 600 "$CODEX_PROXY_ENV"
+
+  cat > "$CODEX_PROXY_LAUNCHER" <<EOF_LAUNCHER
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH="${USER_BIN_DIR}:\${PATH}"
+set -a
+. "${CODEX_PROXY_ENV}"
+set +a
+exec node "${CODEX_PROXY_BIN}" "\$@"
+EOF_LAUNCHER
+  chmod 700 "$CODEX_PROXY_LAUNCHER"
+}
+
+restart_proxy_service_if_running() {
+  if ! need_cmd systemctl; then
+    say "Proxy can be started manually with: $CODEX_PROXY_LAUNCHER"
+    return
+  fi
+
+  if systemctl --user is-active --quiet agent-router-codex-proxy.service; then
+    systemctl --user restart agent-router-codex-proxy.service
+    say "Restarted user service: agent-router-codex-proxy.service"
+    return
+  fi
+
+  if [ -f "$CODEX_SERVICE_FILE" ]; then
+    say "Proxy service exists but is not running. Start it with:"
+    say "  systemctl --user start agent-router-codex-proxy.service"
+  else
+    say "Proxy can be started manually with: $CODEX_PROXY_LAUNCHER"
+  fi
+}
+
+main() {
+  say "agent-router Codex provider switcher"
+  say
+
+  local current_model
+  current_model="$(codex_config_root_value model || true)"
+  say "Current Codex model: ${current_model:-not configured}"
+  say
+
+  say "Choose Codex upstream protocol:"
+  say "  1) Responses API (OpenAI or compatible). Recommended for current Codex."
+  say "  2) Chat Completions API (use local Responses adapter for older compatible services)."
+  local protocol_choice
+  protocol_choice="$(prompt_default 'Protocol choice' '1')"
+
+  local default_model="${current_model:-gpt-5.5}"
+  local api_format="responses"
+  local default_base_url
+  local provider_name
+  local base_url
+
+  case "$protocol_choice" in
+    2)
+      api_format="responses-chat"
+      default_base_url="http://127.0.0.1:8000/v1"
+      provider_name="Agent Router Chat Completions Adapter"
+      base_url="$(normalize_openai_base_url "$(prompt_default 'Chat Completions-compatible base URL' "$default_base_url")")"
+      ;;
+    *)
+      default_base_url="https://api.openai.com/v1"
+      provider_name="Agent Router Responses API"
+      base_url="$(normalize_openai_base_url "$(prompt_default 'Responses-compatible base URL' "$default_base_url")")"
+      ;;
+  esac
+
+  local api_key
+  if [ "$api_format" = "responses-chat" ]; then
+    say "API Key input is hidden. Leave empty to use EMPTY for a local server without auth."
+    api_key="$(prompt_secret 'API Key')"
+    api_key="${api_key:-EMPTY}"
+  else
+    say "API Key input is hidden. Paste the key, then press Enter."
+    api_key="$(prompt_required_secret 'API Key')"
+  fi
+
+  local model
+  model="$(select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
+  local reasoning_effort
+  reasoning_effort="$(prompt_default 'Codex reasoning effort' 'high')"
+
+  write_codex_auth_files "$api_key"
+
+  if [ "$api_format" = "responses-chat" ]; then
+    local port
+    port="$(prompt_default 'Local proxy port' '8081')"
+    write_proxy_env_for_codex_chat "$base_url" "$api_key" "$port"
+    write_codex_config "http://127.0.0.1:${port}/v1" "$model" "$provider_name" "$reasoning_effort"
+    restart_proxy_service_if_running
+  else
+    write_codex_config "$base_url" "$model" "$provider_name" "$reasoning_effort"
+  fi
+
+  say
+  say "Done. Open Codex again for the new provider/model to take effect."
+}
+
+main "$@"
+EOF_CODEX_SWITCHER
+
+  chmod 700 "$CODEX_SWITCHER_HELPER"
+}
+
+run_claude_setup() {
   say "agent-router: Claude Code provider headless installer"
   say
 
@@ -2502,6 +4103,58 @@ main() {
   say
   say "Switch provider/model later with:"
   say "  ${SWITCHER_BIN}"
+}
+
+run_codex_setup() {
+  say "agent-router: Codex provider headless installer"
+  say
+
+  install_codex_cli
+  configure_codex_provider
+  if [ ! -f "$CODEX_PROXY_BIN" ]; then
+    write_codex_proxy_files "codex" "http://127.0.0.1:8000/v1" "EMPTY" "8081" "authorization" "responses-chat" >/dev/null
+  fi
+  write_switcher_command
+
+  say
+  say "Done."
+  local codex_cmd="codex"
+  if [ -x "${USER_BIN_DIR}/codex" ]; then
+    codex_cmd="${USER_BIN_DIR}/codex"
+  fi
+  say "Test with:"
+  say "  ${codex_cmd} exec 'Reply only OK'"
+  say
+  say "Interactive Codex:"
+  say "  ${codex_cmd}"
+  say
+  say "Switch provider/model later with:"
+  say "  ${SWITCHER_BIN}"
+}
+
+main() {
+  say "agent-router headless installer"
+  say
+  say "Choose target tool:"
+  say "  1) Claude Code"
+  say "  2) Codex CLI"
+  say "  3) Both"
+  local target_choice
+  target_choice="$(prompt_default 'Target choice' '1')"
+
+  case "$target_choice" in
+    2)
+      run_codex_setup
+      ;;
+    3)
+      run_claude_setup
+      say
+      run_codex_setup
+      ;;
+    *)
+      run_claude_setup
+      ;;
+  esac
 }
 
 main "$@"

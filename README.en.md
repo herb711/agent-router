@@ -2,9 +2,9 @@
 
 [中文](README.md) | [English](README.en.md)
 
-agent-router is a headless Claude Code provider installer and switcher for servers and terminal-only environments. It installs or reuses Claude Code, writes `~/.claude/settings.json`, and provides the `ccr` command for switching between MiniMax, DeepSeek V4, Kimi, and vLLM.
+agent-router is a headless Claude Code and Codex CLI provider installer and switcher for servers and terminal-only environments. It can install or reuse Claude Code and Codex CLI, write `~/.claude/settings.json` or `~/.codex/config.toml`, and uses one unified `ccr` command for provider switching.
 
-This project is not affiliated with Anthropic, MiniMax, DeepSeek, Moonshot AI/Kimi, or vLLM.
+This project is not affiliated with Anthropic, OpenAI, MiniMax, DeepSeek, Moonshot AI/Kimi, or vLLM.
 
 ## Install
 
@@ -38,17 +38,29 @@ Run this for the first installation:
 bash install.sh
 ```
 
+The installer first asks which tool to configure:
+
+```text
+Choose target tool:
+  1) Claude Code
+  2) Codex CLI
+  3) Both
+Target choice [1]:
+```
+
 Run this later when you want to switch provider or model:
 
 ```bash
 ccr
 ```
 
+`ccr` detects installed commands automatically. If only Claude Code is installed, it opens the Claude Code flow directly. If only Codex CLI is installed, it opens the Codex flow directly. If both are installed, it asks which tool to configure.
+
 Square brackets show the default value. For example, `[1]` and `[8080]` mean you can press Enter to use that value.
 
-### Choose Provider
+### Choose Claude Code Provider
 
-The script shows:
+When configuring Claude Code, the script shows:
 
 ```text
 Choose upstream provider:
@@ -100,6 +112,29 @@ http://113.249.108.72:15581
 ```
 
 The script automatically appends `/v1`.
+
+### Configure Codex CLI
+
+Codex CLI uses the OpenAI Responses API protocol. Some OpenAI-compatible services, especially domestic or self-hosted deployments, still expose only Chat Completions. For that reason Codex setup asks for the upstream protocol:
+
+```text
+Choose Codex upstream protocol:
+  1) Responses API (OpenAI or compatible). Recommended for current Codex.
+  2) Chat Completions API (use local Responses adapter for older compatible services).
+Protocol choice [1]:
+```
+
+Choose `1` for OpenAI or a provider that already supports `/v1/responses`. The installer writes a custom Codex provider with `wire_api = "responses"` in `~/.codex/config.toml`.
+
+Choose `2` for vLLM or OpenAI-compatible services that only support `/v1/chat/completions`. The installer creates a separate local Codex adapter:
+
+```text
+~/.local/bin/agent-router-codex-proxy
+~/.local/share/agent-router-codex-proxy/proxy.env
+~/.config/systemd/user/agent-router-codex-proxy.service
+```
+
+Codex then calls `http://127.0.0.1:<port>/v1/responses`, while the adapter calls the upstream `/chat/completions` endpoint.
 
 ### Choose Model
 
@@ -212,6 +247,8 @@ claude
 
 ## Supported Providers
 
+Claude Code:
+
 - MiniMax
 - DeepSeek V4
 - Kimi
@@ -220,6 +257,11 @@ claude
 MiniMax, DeepSeek, and Kimi use Anthropic-compatible APIs. They can be used directly or through the local proxy.
 
 vLLM exposes OpenAI-compatible `/chat/completions`, while Claude Code speaks the Anthropic Messages API. For that reason, vLLM always uses the local `agent-router-proxy` adapter.
+
+Codex CLI:
+
+- Responses API-compatible providers, including OpenAI
+- Chat Completions-compatible providers through the local `agent-router-codex-proxy` adapter
 
 ## vLLM Flow
 
@@ -265,7 +307,7 @@ curl http://127.0.0.1:8080/health
 
 ## Switch Provider or Model
 
-After installation, run:
+For Claude Code, run:
 
 ```bash
 ~/.local/bin/ccr
@@ -285,12 +327,20 @@ agent-router
 
 The switcher shows the current provider, base URL, and model. If you keep the same provider, you can leave the API key prompt empty to reuse the stored key. If local proxy mode is active, the switcher updates `proxy.env` and restarts `agent-router-proxy.service` when it is running.
 
+Codex CLI uses the same `ccr` command. When both `claude` and `codex` are on `PATH`, `ccr` shows a tool selection menu; when only one is installed, it enters that flow directly.
+
 ## Test
 
 Command-line test:
 
 ```bash
 claude -p 'Reply only OK'
+```
+
+Codex command-line test:
+
+```bash
+codex exec 'Reply only OK'
 ```
 
 Interactive Claude Code:
@@ -311,6 +361,7 @@ curl http://127.0.0.1:8080/health
 ### Current Version
 
 - Added vLLM OpenAI-compatible API support through the local `agent-router-proxy` adapter for Claude Code's Anthropic Messages API.
+- Added Codex CLI setup and unified switching through `ccr`, which auto-routes based on installed Claude Code / Codex CLI commands. Codex configuration uses `wire_api = "responses"` and can optionally run a separate local Responses-to-Chat-Completions adapter for upstreams that have not implemented Responses API yet.
 - Changed the vLLM setup flow to ask for the base URL first, discover `/models`, ask for a manual model name only when discovery fails, and prompt for the API key last.
 - Fixed the systemd user service failing to start the proxy when `node` is not on systemd's default `PATH`.
 - Renamed the local proxy service to `agent-router-proxy.service` to avoid collisions with other projects.

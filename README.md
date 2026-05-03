@@ -2,9 +2,9 @@
 
 [中文](README.md) | [English](README.en.md)
 
-agent-router 是一个面向服务器和纯终端环境的 Claude Code 模型路由安装器。它会安装或复用 Claude Code，写入 `~/.claude/settings.json`，并提供 `ccr` 命令在 MiniMax、DeepSeek V4、Kimi 和 vLLM 之间切换。
+agent-router 是一个面向服务器和纯终端环境的 Claude Code / Codex CLI 模型路由安装器。它会安装或复用 Claude Code 和 Codex CLI，写入 `~/.claude/settings.json` 或 `~/.codex/config.toml`，并统一使用 `ccr` 切换配置。
 
-本项目不隶属于 Anthropic、MiniMax、DeepSeek、Moonshot AI/Kimi 或 vLLM。
+本项目不隶属于 Anthropic、OpenAI、MiniMax、DeepSeek、Moonshot AI/Kimi 或 vLLM。
 
 ## 安装
 
@@ -38,17 +38,29 @@ export AGENT_ROUTER_NODE_MIRROR=https://npmmirror.com/mirrors/node
 bash install.sh
 ```
 
+脚本会先询问要配置哪个工具：
+
+```text
+Choose target tool:
+  1) Claude Code
+  2) Codex CLI
+  3) Both
+Target choice [1]:
+```
+
 以后想换模型或换服务商，运行：
 
 ```bash
 ccr
 ```
 
+`ccr` 会根据当前已安装的命令自动选择：只安装 Claude Code 时直接进入 Claude Code 配置，只安装 Codex CLI 时直接进入 Codex 配置；如果两个都安装了，才会询问要配置哪一个。
+
 提示里的方括号表示默认值。例如 `[1]`、`[8080]` 都可以直接按回车使用默认值。
 
-### 选择服务商
+### 选择 Claude Code 服务商
 
-脚本会显示：
+配置 Claude Code 时，脚本会显示：
 
 ```text
 Choose upstream provider:
@@ -100,6 +112,29 @@ http://113.249.108.72:15581
 ```
 
 脚本会自动补成 `/v1`。
+
+### 配置 Codex CLI
+
+新版 Codex CLI 使用 OpenAI Responses API 协议。国内很多 OpenAI-compatible 服务还停在 Chat Completions，所以 Codex 配置会先询问上游协议：
+
+```text
+Choose Codex upstream protocol:
+  1) Responses API (OpenAI or compatible). Recommended for current Codex.
+  2) Chat Completions API (use local Responses adapter for older compatible services).
+Protocol choice [1]:
+```
+
+如果上游已经支持 `/v1/responses`，选择 `1`。脚本会在 `~/.codex/config.toml` 写入自定义 provider，并设置 `wire_api = "responses"`。
+
+如果上游只支持 `/v1/chat/completions`，选择 `2`。脚本会安装独立的 Codex 本地适配代理：
+
+```text
+~/.local/bin/agent-router-codex-proxy
+~/.local/share/agent-router-codex-proxy/proxy.env
+~/.config/systemd/user/agent-router-codex-proxy.service
+```
+
+这样 Codex 仍然访问本地 `/v1/responses`，由代理再转发到上游 `/chat/completions`。
 
 ### 选择模型
 
@@ -212,6 +247,8 @@ claude
 
 ## 支持的模型服务
 
+Claude Code：
+
 - MiniMax
 - DeepSeek V4
 - Kimi
@@ -220,6 +257,11 @@ claude
 MiniMax、DeepSeek 和 Kimi 走 Anthropic-compatible API，可以直连，也可以走本地代理。
 
 vLLM 走 OpenAI-compatible `/chat/completions`，而 Claude Code 使用 Anthropic Messages API，所以 vLLM 会固定使用本地 `agent-router-proxy` 做协议适配。
+
+Codex CLI：
+
+- 支持 Responses API 的 OpenAI 或兼容服务
+- 只支持 Chat Completions 的兼容服务，通过本地 `agent-router-codex-proxy` 适配
 
 ## vLLM 流程
 
@@ -265,7 +307,7 @@ curl http://127.0.0.1:8080/health
 
 ## 切换模型
 
-安装后运行：
+Claude Code 安装后运行：
 
 ```bash
 ~/.local/bin/ccr
@@ -285,12 +327,20 @@ agent-router
 
 切换器会显示当前 provider、base URL 和模型。保持同一个 provider 时，API key 可以留空以复用已保存的 key。如果本地代理服务正在运行，切换器会更新 `proxy.env` 并重启 `agent-router-proxy.service`。
 
+Codex CLI 也使用同一个 `ccr`。如果系统里同时存在 `claude` 和 `codex`，`ccr` 会显示工具选择菜单；如果只存在其中一个，它会直接进入对应切换流程。
+
 ## 测试
 
 命令行测试：
 
 ```bash
 claude -p 'Reply only OK'
+```
+
+Codex 命令行测试：
+
+```bash
+codex exec 'Reply only OK'
 ```
 
 交互模式：
@@ -311,6 +361,7 @@ curl http://127.0.0.1:8080/health
 ### 当前版本
 
 - 新增 vLLM OpenAI-compatible API 支持，通过本地 `agent-router-proxy` 适配 Claude Code 的 Anthropic Messages API。
+- 新增 Codex CLI 安装，并统一由 `ccr` 根据已安装的 Claude Code / Codex CLI 自动分流。Codex 配置固定使用 `wire_api = "responses"`，并可为仍停留在 Chat Completions 的上游启用独立本地 Responses-to-Chat-Completions 适配代理。
 - vLLM 配置流程调整为先填写 base URL，再自动发现 `/models`，发现失败时手动输入模型名，最后填写 API key。
 - 修复 systemd 用户服务启动代理时找不到 `node` 的问题。
 - 本地代理服务统一命名为 `agent-router-proxy.service`，避免与其他项目重名。
