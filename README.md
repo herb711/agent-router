@@ -14,7 +14,7 @@ agent-router 是一个面向服务器和纯终端环境的 Claude Code / Codex C
 
 ```bash
 curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
-  https://cdn.jsdelivr.net/gh/herb711/agent-router@main/install.sh -o install.sh
+  https://fastly.jsdelivr.net/gh/herb711/agent-router@main/install.sh -o install.sh
 less install.sh
 bash install.sh
 ```
@@ -23,10 +23,10 @@ bash install.sh
 
 ```bash
 curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
-  https://cdn.jsdelivr.net/gh/herb711/agent-router@main/install.sh | bash
+  https://fastly.jsdelivr.net/gh/herb711/agent-router@main/install.sh | bash
 ```
 
-如果你使用 `raw.githubusercontent.com` 一直没有输出，通常是网络连不上 GitHub raw 域名；`curl -s` 会隐藏下载进度，所以看起来像卡住。上面的 jsDelivr 地址在国内网络通常更稳定。
+如果你使用 `raw.githubusercontent.com` 一直没有输出，通常是网络连不上 GitHub raw 域名；`curl -s` 会隐藏下载进度，所以看起来像卡住。上面的 `fastly.jsdelivr.net` 地址在国内网络通常更稳定，也比 `cdn.jsdelivr.net` 更不容易拿到旧缓存。
 
 如果访问 `nodejs.org` 不稳定，可以先设置镜像：
 

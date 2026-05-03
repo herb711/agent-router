@@ -14,7 +14,7 @@ Review the script before running it:
 
 ```bash
 curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
-  https://cdn.jsdelivr.net/gh/herb711/agent-router@main/install.sh -o install.sh
+  https://fastly.jsdelivr.net/gh/herb711/agent-router@main/install.sh -o install.sh
 less install.sh
 bash install.sh
 ```
@@ -23,10 +23,10 @@ One-line install:
 
 ```bash
 curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
-  https://cdn.jsdelivr.net/gh/herb711/agent-router@main/install.sh | bash
+  https://fastly.jsdelivr.net/gh/herb711/agent-router@main/install.sh | bash
 ```
 
-If `raw.githubusercontent.com` appears to hang with no output, the network usually cannot reach GitHub raw. `curl -s` hides progress, so it looks stuck. The jsDelivr URL above is usually more reliable from domestic networks.
+If `raw.githubusercontent.com` appears to hang with no output, the network usually cannot reach GitHub raw. `curl -s` hides progress, so it looks stuck. The `fastly.jsdelivr.net` URL above is usually more reliable from domestic networks and is less likely than `cdn.jsdelivr.net` to serve stale cache.
 
 If `nodejs.org` is hard to reach from your network, set a mirror first:
 
