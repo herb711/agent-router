@@ -13,7 +13,8 @@ Requirement: `curl`. If Node.js/npm is missing, the installer can install Node.j
 Review the script before running it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/herb711/agent-router/main/install.sh -o install.sh
+curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
+  https://cdn.jsdelivr.net/gh/herb711/agent-router@main/install.sh -o install.sh
 less install.sh
 bash install.sh
 ```
@@ -21,8 +22,11 @@ bash install.sh
 One-line install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/herb711/agent-router/main/install.sh | bash
+curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
+  https://cdn.jsdelivr.net/gh/herb711/agent-router@main/install.sh | bash
 ```
+
+If `raw.githubusercontent.com` appears to hang with no output, the network usually cannot reach GitHub raw. `curl -s` hides progress, so it looks stuck. The jsDelivr URL above is usually more reliable from domestic networks.
 
 If `nodejs.org` is hard to reach from your network, set a mirror first:
 
@@ -66,8 +70,9 @@ When configuring Claude Code, the script shows:
 Choose upstream provider:
   1) MiniMax
   2) DeepSeek V4
-  3) Kimi
-  4) vLLM (OpenAI-compatible)
+  3) Zhipu GLM
+  4) Kimi
+  5) Custom OpenAI-compatible / vLLM
 Provider choice [1]:
 ```
 
@@ -75,8 +80,9 @@ Type a number and press Enter:
 
 - MiniMax: press Enter, or type `1`
 - DeepSeek V4: type `2`
-- Kimi: type `3`
-- Your own vLLM server: type `4`
+- Zhipu GLM: type `3`
+- Kimi: type `4`
+- Your own vLLM or another OpenAI-compatible service: type `5`
 
 ### Enter Service URL
 
@@ -91,9 +97,9 @@ Endpoint choice [1]:
 
 For China mainland usage, press Enter. For the international endpoint, type `2`.
 
-DeepSeek V4 and Kimi use built-in default endpoints, so you usually do not need to enter a URL manually.
+DeepSeek V4, Zhipu GLM, and Kimi use built-in default endpoints, so you usually do not need to enter a URL manually.
 
-vLLM asks for an OpenAI-compatible base URL:
+Custom OpenAI-compatible / vLLM asks for an OpenAI-compatible base URL:
 
 ```text
 OpenAI-compatible base URL [http://127.0.0.1:8000/v1]:
@@ -115,14 +121,25 @@ The script automatically appends `/v1`.
 
 ### Configure Codex CLI
 
-Codex CLI uses the OpenAI Responses API protocol. This installer is optimized for domestic or self-hosted OpenAI-compatible model services, so Codex setup tries to ask for only two values: `base URL` and `API key`.
+Codex CLI uses the OpenAI Responses API protocol. Many domestic OpenAI-compatible services still expose Chat Completions, so the installer asks for the provider first and fills the service URL automatically.
+
+```text
+Choose Codex upstream provider:
+  1) MiniMax
+  2) DeepSeek
+  3) Zhipu GLM
+  4) Kimi / Moonshot
+  5) Custom OpenAI-compatible / vLLM
+Provider choice [1]:
+```
+
+When you choose MiniMax, DeepSeek, Zhipu GLM, or Kimi, the script uses a built-in OpenAI-compatible URL and does not ask you to enter one. Only `Custom OpenAI-compatible / vLLM` asks for:
 
 ```text
 OpenAI-compatible base URL [http://127.0.0.1:8000/v1]:
-API Key:
 ```
 
-After that, the script calls `${base URL}/models` automatically and turns the returned models into a menu:
+After you enter the API key, the script calls `${base URL}/models` automatically and turns the returned models into a menu:
 
 ```text
 Checking models from http://113.249.108.72:15581/v1/models...
@@ -151,7 +168,7 @@ Codex then calls the local `/v1/responses` endpoint, while the adapter calls the
 
 ### Choose Model
 
-MiniMax, DeepSeek V4, and Kimi show a model menu, for example:
+MiniMax, DeepSeek V4, Zhipu GLM, and Kimi show a model menu, for example:
 
 ```text
 Primary model:
@@ -223,14 +240,14 @@ Mode [1]:
 
 Usually, press Enter to use `Direct mode`. Choose `2` only when you explicitly want Claude Code to go through a local proxy first.
 
-vLLM does not show this choice because it always needs the local adapter proxy. You will see:
+Zhipu GLM and Custom OpenAI-compatible / vLLM do not show this choice because they always need the local adapter proxy. You will see:
 
 ```text
-vLLM uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy.
+Zhipu GLM uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy.
 Local proxy port [8080]:
 ```
 
-This is the local proxy port used by Claude Code. It is not the vLLM server port. Usually, press Enter to use `8080`. If `8080` is already occupied, enter another free local port, for example:
+This is the local proxy port used by Claude Code. It is not the upstream server port. Usually, press Enter to use `8080`. If `8080` is already occupied, enter another free local port, for example:
 
 ```text
 18080
@@ -238,7 +255,7 @@ This is the local proxy port used by Claude Code. It is not the vLLM server port
 
 ### Start Local Proxy Service
 
-If you use vLLM or choose local proxy mode, the script asks:
+If you use Zhipu GLM, Custom OpenAI-compatible / vLLM, or choose local proxy mode, the script asks:
 
 ```text
 Start proxy as a systemd user service now? [Y/n]:
@@ -264,12 +281,13 @@ Claude Code:
 
 - MiniMax
 - DeepSeek V4
+- Zhipu GLM
 - Kimi
-- vLLM, OpenAI-compatible API
+- Custom OpenAI-compatible / vLLM
 
 MiniMax, DeepSeek, and Kimi use Anthropic-compatible APIs. They can be used directly or through the local proxy.
 
-vLLM exposes OpenAI-compatible `/chat/completions`, while Claude Code speaks the Anthropic Messages API. For that reason, vLLM always uses the local `agent-router-proxy` adapter.
+Zhipu GLM and Custom OpenAI-compatible / vLLM expose OpenAI-compatible `/chat/completions`, while Claude Code speaks the Anthropic Messages API. For that reason, they always use the local `agent-router-proxy` adapter.
 
 Codex CLI:
 
@@ -280,8 +298,8 @@ Codex CLI:
 
 vLLM needs a few extra notes:
 
-- vLLM always uses local proxy mode because Claude Code's Anthropic Messages API must be adapted to an OpenAI-compatible API.
-- If the vLLM base URL is left empty, the default local URL is used:
+- Zhipu GLM and Custom OpenAI-compatible / vLLM always use local proxy mode because Claude Code's Anthropic Messages API must be adapted to an OpenAI-compatible API.
+- If the Custom OpenAI-compatible / vLLM base URL is left empty, the default local URL is used:
 
 ```text
 http://127.0.0.1:8000/v1

@@ -164,6 +164,12 @@ model_note() {
     printf '%s' "recommended primary, 1M context"
   elif [ "$model" = "deepseek-v4-flash" ]; then
     printf '%s' "recommended small/fast"
+  elif [ "$model" = "glm-5" ]; then
+    printf '%s' "recommended"
+  elif [ "$model" = "glm-5-turbo" ]; then
+    printf '%s' "fast"
+  elif [ "$model" = "glm-5.1" ]; then
+    printf '%s' "latest"
   elif [ "$model" = "kimi-k2.5" ]; then
     printf '%s' "recommended for Claude Code"
   elif [ "$model" = "kimi-k2.6" ]; then
@@ -1631,9 +1637,19 @@ Environment=PATH=${USER_BIN_DIR}:/usr/local/bin:/usr/bin:/bin
 WantedBy=default.target
 EOF_SERVICE
 
-  systemctl --user daemon-reload
-  systemctl --user enable --now agent-router-proxy.service
-  say "Started user service: agent-router-proxy.service"
+  if systemctl --user daemon-reload && systemctl --user enable agent-router-proxy.service >/dev/null 2>&1; then
+    if systemctl --user is-active --quiet agent-router-proxy.service; then
+      systemctl --user restart agent-router-proxy.service
+      say "Restarted user service: agent-router-proxy.service"
+    else
+      systemctl --user start agent-router-proxy.service
+      say "Started user service: agent-router-proxy.service"
+    fi
+  else
+    say "Could not start agent-router-proxy.service automatically."
+    say "Start it manually with: systemctl --user start agent-router-proxy.service"
+    say "Or run the proxy directly with: $PROXY_LAUNCHER"
+  fi
 }
 
 write_codex_proxy_files() {
@@ -1684,8 +1700,14 @@ Environment=PATH=${USER_BIN_DIR}:/usr/local/bin:/usr/bin:/bin
 WantedBy=default.target
 EOF_SERVICE
 
-  if systemctl --user daemon-reload && systemctl --user enable --now agent-router-codex-proxy.service; then
-    say "Started user service: agent-router-codex-proxy.service"
+  if systemctl --user daemon-reload && systemctl --user enable agent-router-codex-proxy.service >/dev/null 2>&1; then
+    if systemctl --user is-active --quiet agent-router-codex-proxy.service; then
+      systemctl --user restart agent-router-codex-proxy.service
+      say "Restarted user service: agent-router-codex-proxy.service"
+    else
+      systemctl --user start agent-router-codex-proxy.service
+      say "Started user service: agent-router-codex-proxy.service"
+    fi
   else
     say "Could not start agent-router-codex-proxy.service automatically."
     say "Start it manually with: systemctl --user start agent-router-codex-proxy.service"
@@ -1741,6 +1763,21 @@ codex_current_api_key() {
     return
   fi
   env_file_value "$CODEX_ENV" CODEX_PROVIDER_API_KEY || true
+}
+
+codex_provider_from_base_url() {
+  local base_url="$1"
+  local lower
+  lower="$(printf '%s' "$base_url" | tr '[:upper:]' '[:lower:]')"
+
+  case "$lower" in
+    *deepseek*) printf '%s' "deepseek" ;;
+    *bigmodel*|*z.ai*|*zhipu*) printf '%s' "zhipu" ;;
+    *moonshot*|*kimi*) printf '%s' "kimi" ;;
+    *minimaxi*|*minimax*) printf '%s' "minimax" ;;
+    *openai.com*) printf '%s' "openai" ;;
+    *) printf '%s' "custom" ;;
+  esac
 }
 
 codex_base_url_api_format() {
@@ -1963,24 +2000,90 @@ configure_codex_provider() {
   existing_model="$(codex_config_root_value model || true)"
   [ -n "$existing_model" ] && default_model="$existing_model"
 
-  local default_base_url
-  default_base_url="$(codex_current_upstream_base_url || true)"
-  default_base_url="${default_base_url:-http://127.0.0.1:8000/v1}"
+  local current_base_url
+  current_base_url="$(codex_current_upstream_base_url || true)"
+  local current_provider
+  current_provider="$(codex_provider_from_base_url "$current_base_url")"
+  local provider_choice
+  local default_provider_choice="1"
+  case "$current_provider" in
+    deepseek) default_provider_choice="2" ;;
+    zhipu) default_provider_choice="3" ;;
+    kimi) default_provider_choice="4" ;;
+    custom|openai) default_provider_choice="5" ;;
+  esac
 
+  say "Choose Codex upstream provider:"
+  say "  1) MiniMax"
+  say "  2) DeepSeek"
+  say "  3) Zhipu GLM"
+  say "  4) Kimi / Moonshot"
+  say "  5) Custom OpenAI-compatible / vLLM"
+  provider_choice="$(prompt_default 'Provider choice' "$default_provider_choice")"
+
+  local provider
+  local provider_label
   local base_url
-  base_url="$(normalize_openai_base_url "$(prompt_default 'OpenAI-compatible base URL' "$default_base_url")")"
+  case "$provider_choice" in
+    2)
+      provider="deepseek"
+      provider_label="DeepSeek"
+      base_url="https://api.deepseek.com/v1"
+      [ "$current_provider" = "$provider" ] || default_model="deepseek-chat"
+      say "DeepSeek OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    3)
+      provider="zhipu"
+      provider_label="Zhipu GLM"
+      base_url="https://open.bigmodel.cn/api/paas/v4"
+      [ "$current_provider" = "$provider" ] || default_model="glm-5"
+      say "Zhipu GLM OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    4)
+      provider="kimi"
+      provider_label="Kimi"
+      base_url="https://api.moonshot.cn/v1"
+      [ "$current_provider" = "$provider" ] || default_model="kimi-k2.5"
+      say "Kimi OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    5)
+      provider="custom"
+      provider_label="Custom OpenAI-compatible"
+      local default_base_url="${current_base_url:-http://127.0.0.1:8000/v1}"
+      base_url="$(normalize_openai_base_url "$(prompt_default 'OpenAI-compatible base URL' "$default_base_url")")"
+      [ "$current_provider" = "custom" ] || [ "$current_provider" = "openai" ] || default_model=""
+      say "Custom OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    *)
+      provider="minimax"
+      provider_label="MiniMax"
+      [ "$current_provider" = "$provider" ] || default_model="MiniMax-M2.7"
+      say "Choose MiniMax endpoint:"
+      say "  1) China mainland: https://api.minimaxi.com/v1"
+      say "  2) International:  https://api.minimax.io/v1"
+      local endpoint_choice
+      endpoint_choice="$(prompt_default 'Endpoint choice' '1')"
+      case "$endpoint_choice" in
+        2) base_url="https://api.minimax.io/v1" ;;
+        *) base_url="https://api.minimaxi.com/v1" ;;
+      esac
+      ;;
+  esac
 
   local existing_api_key
   existing_api_key="$(codex_current_api_key || true)"
   local api_key
-  if [ -n "$existing_api_key" ]; then
+  if [ -n "$existing_api_key" ] && [ "$provider" = "$current_provider" ]; then
     say "API Key input is hidden. Press Enter to reuse the saved key."
-    api_key="$(prompt_secret 'API Key')"
+    api_key="$(prompt_secret "${provider_label} API Key")"
     api_key="${api_key:-$existing_api_key}"
-  else
-    say "API Key input is hidden. Leave empty only for a local/no-auth server."
-    api_key="$(prompt_secret 'API Key')"
+  elif [ "$provider" = "custom" ]; then
+    say "${provider_label} API Key input is hidden. Leave empty only for a local/no-auth server."
+    api_key="$(prompt_secret "${provider_label} API Key")"
     api_key="${api_key:-EMPTY}"
+  else
+    say "${provider_label} API Key input is hidden. Paste the key, then press Enter."
+    api_key="$(prompt_required_secret "${provider_label} API Key")"
   fi
 
   local model
@@ -2131,6 +2234,12 @@ model_note() {
     printf '%s' "recommended primary, 1M context"
   elif [ "$model" = "deepseek-v4-flash" ]; then
     printf '%s' "recommended small/fast"
+  elif [ "$model" = "glm-5" ]; then
+    printf '%s' "recommended"
+  elif [ "$model" = "glm-5-turbo" ]; then
+    printf '%s' "fast"
+  elif [ "$model" = "glm-5.1" ]; then
+    printf '%s' "latest"
   elif [ "$model" = "kimi-k2.5" ]; then
     printf '%s' "recommended for Claude Code"
   elif [ "$model" = "kimi-k2.6" ]; then
@@ -2246,12 +2355,18 @@ normalize_openai_base_url() {
 
 discover_openai_models() {
   local base_url="$1"
+  local api_key="${2:-}"
   local models_url="${base_url%/}/models"
+  local curl_args=()
 
   need_cmd curl || return 1
   need_cmd node || return 1
 
-  curl -fsS --connect-timeout 5 --max-time 10 "$models_url" 2>/dev/null | node -e '
+  if [ -n "$api_key" ] && [ "$api_key" != "EMPTY" ]; then
+    curl_args=(-H "Authorization: Bearer ${api_key}")
+  fi
+
+  curl -fsS --connect-timeout 5 --max-time 10 "${curl_args[@]}" "$models_url" 2>/dev/null | node -e '
 const chunks = [];
 process.stdin.on("data", chunk => chunks.push(chunk));
 process.stdin.on("end", () => {
@@ -2312,12 +2427,13 @@ select_discovered_model_menu() {
 select_openai_model_from_base_url() {
   local base_url="$1"
   local fallback_model="${2:-}"
+  local api_key="${3:-}"
   local model_lines
   local models=()
   local model
 
   tty_say "Checking models from ${base_url%/}/models..."
-  if model_lines="$(discover_openai_models "$base_url")" && [ -n "$model_lines" ]; then
+  if model_lines="$(discover_openai_models "$base_url" "$api_key")" && [ -n "$model_lines" ]; then
     while IFS= read -r model; do
       [ -n "$model" ] && models+=("$model")
     done <<< "$model_lines"
@@ -2387,6 +2503,7 @@ current_provider() {
       esac
       ;;
     *deepseek*) printf '%s' "deepseek" ;;
+    *bigmodel*|*z.ai*|*zhipu*) printf '%s' "zhipu" ;;
     *moonshot*|*kimi*) printf '%s' "kimi" ;;
     *vllm*) printf '%s' "vllm" ;;
     *minimax*|*minimaxi*) printf '%s' "minimax" ;;
@@ -3546,8 +3663,12 @@ restart_proxy_service_if_running() {
   fi
 
   if [ -f "$SERVICE_FILE" ]; then
-    say "Proxy service exists but is not running. Start it with:"
-    say "  systemctl --user start agent-router-proxy.service"
+    if systemctl --user daemon-reload && systemctl --user start agent-router-proxy.service; then
+      say "Started user service: agent-router-proxy.service"
+    else
+      say "Proxy service exists but could not be started automatically. Start it with:"
+      say "  systemctl --user start agent-router-proxy.service"
+    fi
   else
     say "Proxy can be started manually with: $PROXY_LAUNCHER"
   fi
@@ -3572,8 +3693,9 @@ main() {
   say "Choose upstream provider:"
   say "  1) MiniMax"
   say "  2) DeepSeek V4"
-  say "  3) Kimi"
-  say "  4) vLLM (OpenAI-compatible)"
+  say "  3) Zhipu GLM"
+  say "  4) Kimi"
+  say "  5) Custom OpenAI-compatible / vLLM"
   local provider_choice
   provider_choice="$(prompt_default 'Provider choice' '1')"
 
@@ -3601,6 +3723,16 @@ main() {
       say "DeepSeek Anthropic endpoint: ${base_url}"
       ;;
     3)
+      provider="zhipu"
+      provider_label="Zhipu GLM"
+      base_url="https://open.bigmodel.cn/api/paas/v4"
+      auth_header="authorization"
+      default_model="glm-5"
+      default_small_model="$default_model"
+      api_format="openai-chat"
+      say "Zhipu GLM OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    4)
       provider="kimi"
       provider_label="Kimi"
       base_url="https://api.moonshot.ai/anthropic"
@@ -3610,9 +3742,9 @@ main() {
       enable_tool_search="false"
       say "Kimi Anthropic endpoint: ${base_url}"
       ;;
-    4)
+    5)
       provider="vllm"
-      provider_label="vLLM"
+      provider_label="Custom OpenAI-compatible"
       auth_header="authorization"
       default_model=""
       default_small_model="$default_model"
@@ -3624,7 +3756,7 @@ main() {
         [ -n "$existing_upstream_base_url" ] && default_base_url="$existing_upstream_base_url"
       fi
       base_url="$(normalize_openai_base_url "$(prompt_default 'OpenAI-compatible base URL' "$default_base_url")")"
-      say "vLLM OpenAI-compatible endpoint: ${base_url}"
+      say "Custom OpenAI-compatible endpoint: ${base_url}"
       ;;
     *)
       provider="minimax"
@@ -3653,25 +3785,6 @@ main() {
     [ -n "$existing_small_model" ] && default_small_model="$existing_small_model"
   fi
 
-  local model
-  if [ "$provider" = "vllm" ]; then
-    model="$(select_openai_model_from_base_url "$base_url" "$default_model")"
-  else
-    model="$(select_model_menu "$provider" "primary" "$default_model" "Primary model")"
-  fi
-
-  local small_model
-  if [ "$provider" = "vllm" ]; then
-    small_model="$model"
-  elif [ "$provider" = "deepseek" ]; then
-    small_model="$(select_model_menu "$provider" "small" "$default_small_model" "Small/haiku model")"
-  else
-    small_model="$model"
-  fi
-
-  local large_model="$model"
-  local subagent_model="$small_model"
-
   local api_key
   local existing_api_key=""
   if [ "$provider" = "$existing_provider" ]; then
@@ -3684,7 +3797,7 @@ main() {
       api_key="$(prompt_secret "${provider_label} API Key")"
       api_key="${api_key:-$existing_api_key}"
     else
-      say "${provider_label} API Key input is hidden. Leave empty to use EMPTY for a local vLLM server."
+      say "${provider_label} API Key input is hidden. Leave empty to use EMPTY for a local/no-auth server."
       api_key="$(prompt_secret "${provider_label} API Key")"
       api_key="${api_key:-EMPTY}"
     fi
@@ -3696,6 +3809,25 @@ main() {
     say "${provider_label} API Key input is hidden. Paste the key, then press Enter."
     api_key="$(prompt_required_secret "${provider_label} API Key")"
   fi
+
+  local model
+  if [ "$api_format" = "openai-chat" ]; then
+    model="$(select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
+  else
+    model="$(select_model_menu "$provider" "primary" "$default_model" "Primary model")"
+  fi
+
+  local small_model
+  if [ "$api_format" = "openai-chat" ]; then
+    small_model="$model"
+  elif [ "$provider" = "deepseek" ]; then
+    small_model="$(select_model_menu "$provider" "small" "$default_small_model" "Small/haiku model")"
+  else
+    small_model="$model"
+  fi
+
+  local large_model="$model"
+  local subagent_model="$small_model"
 
   if [ "$api_format" = "openai-chat" ]; then
     say
@@ -4110,6 +4242,21 @@ codex_current_api_key() {
   env_file_value "$CODEX_ENV" CODEX_PROVIDER_API_KEY || true
 }
 
+codex_provider_from_base_url() {
+  local base_url="$1"
+  local lower
+  lower="$(printf '%s' "$base_url" | tr '[:upper:]' '[:lower:]')"
+
+  case "$lower" in
+    *deepseek*) printf '%s' "deepseek" ;;
+    *bigmodel*|*z.ai*|*zhipu*) printf '%s' "zhipu" ;;
+    *moonshot*|*kimi*) printf '%s' "kimi" ;;
+    *minimaxi*|*minimax*) printf '%s' "minimax" ;;
+    *openai.com*) printf '%s' "openai" ;;
+    *) printf '%s' "custom" ;;
+  esac
+}
+
 codex_base_url_api_format() {
   local base_url="$1"
   local lower
@@ -4375,26 +4522,93 @@ main() {
   current_model="$(codex_config_root_value model || true)"
   local current_base_url
   current_base_url="$(codex_current_upstream_base_url || true)"
+  local current_provider
+  current_provider="$(codex_provider_from_base_url "$current_base_url")"
   say "Current Codex model: ${current_model:-not configured}"
   say "Current upstream base URL: ${current_base_url:-not configured}"
   say
 
   local default_model="$current_model"
-  local default_base_url="${current_base_url:-http://127.0.0.1:8000/v1}"
+  local provider_choice
+  local default_provider_choice="1"
+  case "$current_provider" in
+    deepseek) default_provider_choice="2" ;;
+    zhipu) default_provider_choice="3" ;;
+    kimi) default_provider_choice="4" ;;
+    custom|openai) default_provider_choice="5" ;;
+  esac
+
+  say "Choose Codex upstream provider:"
+  say "  1) MiniMax"
+  say "  2) DeepSeek"
+  say "  3) Zhipu GLM"
+  say "  4) Kimi / Moonshot"
+  say "  5) Custom OpenAI-compatible / vLLM"
+  provider_choice="$(prompt_default 'Provider choice' "$default_provider_choice")"
+
+  local provider
+  local provider_label
   local base_url
-  base_url="$(normalize_openai_base_url "$(prompt_default 'OpenAI-compatible base URL' "$default_base_url")")"
+  case "$provider_choice" in
+    2)
+      provider="deepseek"
+      provider_label="DeepSeek"
+      base_url="https://api.deepseek.com/v1"
+      [ "$current_provider" = "$provider" ] || default_model="deepseek-chat"
+      say "DeepSeek OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    3)
+      provider="zhipu"
+      provider_label="Zhipu GLM"
+      base_url="https://open.bigmodel.cn/api/paas/v4"
+      [ "$current_provider" = "$provider" ] || default_model="glm-5"
+      say "Zhipu GLM OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    4)
+      provider="kimi"
+      provider_label="Kimi"
+      base_url="https://api.moonshot.cn/v1"
+      [ "$current_provider" = "$provider" ] || default_model="kimi-k2.5"
+      say "Kimi OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    5)
+      provider="custom"
+      provider_label="Custom OpenAI-compatible"
+      local default_base_url="${current_base_url:-http://127.0.0.1:8000/v1}"
+      base_url="$(normalize_openai_base_url "$(prompt_default 'OpenAI-compatible base URL' "$default_base_url")")"
+      [ "$current_provider" = "custom" ] || [ "$current_provider" = "openai" ] || default_model=""
+      say "Custom OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    *)
+      provider="minimax"
+      provider_label="MiniMax"
+      [ "$current_provider" = "$provider" ] || default_model="MiniMax-M2.7"
+      say "Choose MiniMax endpoint:"
+      say "  1) China mainland: https://api.minimaxi.com/v1"
+      say "  2) International:  https://api.minimax.io/v1"
+      local endpoint_choice
+      endpoint_choice="$(prompt_default 'Endpoint choice' '1')"
+      case "$endpoint_choice" in
+        2) base_url="https://api.minimax.io/v1" ;;
+        *) base_url="https://api.minimaxi.com/v1" ;;
+      esac
+      ;;
+  esac
 
   local existing_api_key
   existing_api_key="$(codex_current_api_key || true)"
   local api_key
-  if [ -n "$existing_api_key" ]; then
+  if [ -n "$existing_api_key" ] && [ "$provider" = "$current_provider" ]; then
     say "API Key input is hidden. Press Enter to reuse the saved key."
-    api_key="$(prompt_secret 'API Key')"
+    api_key="$(prompt_secret "${provider_label} API Key")"
     api_key="${api_key:-$existing_api_key}"
-  else
-    say "API Key input is hidden. Leave empty only for a local/no-auth server."
-    api_key="$(prompt_secret 'API Key')"
+  elif [ "$provider" = "custom" ]; then
+    say "${provider_label} API Key input is hidden. Leave empty only for a local/no-auth server."
+    api_key="$(prompt_secret "${provider_label} API Key")"
     api_key="${api_key:-EMPTY}"
+  else
+    say "${provider_label} API Key input is hidden. Paste the key, then press Enter."
+    api_key="$(prompt_required_secret "${provider_label} API Key")"
   fi
 
   local model
@@ -4445,8 +4659,9 @@ run_claude_setup() {
   say "Choose upstream provider:"
   say "  1) MiniMax"
   say "  2) DeepSeek V4"
-  say "  3) Kimi"
-  say "  4) vLLM (OpenAI-compatible)"
+  say "  3) Zhipu GLM"
+  say "  4) Kimi"
+  say "  5) Custom OpenAI-compatible / vLLM"
   local provider_choice
   provider_choice="$(prompt_default 'Provider choice' '1')"
 
@@ -4474,6 +4689,16 @@ run_claude_setup() {
       say "DeepSeek Anthropic endpoint: ${base_url}"
       ;;
     3)
+      provider="zhipu"
+      provider_label="Zhipu GLM"
+      base_url="https://open.bigmodel.cn/api/paas/v4"
+      auth_header="authorization"
+      default_model="glm-5"
+      default_small_model="$default_model"
+      api_format="openai-chat"
+      say "Zhipu GLM OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    4)
       provider="kimi"
       provider_label="Kimi"
       base_url="https://api.moonshot.ai/anthropic"
@@ -4483,15 +4708,15 @@ run_claude_setup() {
       enable_tool_search="false"
       say "Kimi Anthropic endpoint: ${base_url}"
       ;;
-    4)
+    5)
       provider="vllm"
-      provider_label="vLLM"
+      provider_label="Custom OpenAI-compatible"
       auth_header="authorization"
       default_model=""
       default_small_model="$default_model"
       api_format="openai-chat"
       base_url="$(normalize_openai_base_url "$(prompt_default 'OpenAI-compatible base URL' 'http://127.0.0.1:8000/v1')")"
-      say "vLLM OpenAI-compatible endpoint: ${base_url}"
+      say "Custom OpenAI-compatible endpoint: ${base_url}"
       ;;
     *)
       provider="minimax"
@@ -4511,15 +4736,25 @@ run_claude_setup() {
       ;;
   esac
 
-  local model
+  local api_key
   if [ "$provider" = "vllm" ]; then
-    model="$(select_openai_model_from_base_url "$base_url" "$default_model")"
+    say "${provider_label} API Key input is hidden. Leave empty to use EMPTY for a local/no-auth server."
+    api_key="$(prompt_secret "${provider_label} API Key")"
+    api_key="${api_key:-EMPTY}"
+  else
+    say "${provider_label} API Key input is hidden. Paste the key, then press Enter."
+    api_key="$(prompt_required_secret "${provider_label} API Key")"
+  fi
+
+  local model
+  if [ "$api_format" = "openai-chat" ]; then
+    model="$(select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
   else
     model="$(select_model_menu "$provider" "primary" "$default_model" "Primary model")"
   fi
 
   local small_model
-  if [ "$provider" = "vllm" ]; then
+  if [ "$api_format" = "openai-chat" ]; then
     small_model="$model"
   elif [ "$provider" = "deepseek" ]; then
     small_model="$(select_model_menu "$provider" "small" "$default_small_model" "Small/haiku model")"
@@ -4529,16 +4764,6 @@ run_claude_setup() {
 
   local large_model="$model"
   local subagent_model="$small_model"
-
-  local api_key
-  if [ "$provider" = "vllm" ]; then
-    say "${provider_label} API Key input is hidden. Leave empty to use EMPTY for a local vLLM server."
-    api_key="$(prompt_secret "${provider_label} API Key")"
-    api_key="${api_key:-EMPTY}"
-  else
-    say "${provider_label} API Key input is hidden. Paste the key, then press Enter."
-    api_key="$(prompt_required_secret "${provider_label} API Key")"
-  fi
 
   if [ "$api_format" = "openai-chat" ]; then
     say

@@ -13,7 +13,8 @@ agent-router 是一个面向服务器和纯终端环境的 Claude Code / Codex C
 建议先下载并查看脚本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/herb711/agent-router/main/install.sh -o install.sh
+curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
+  https://cdn.jsdelivr.net/gh/herb711/agent-router@main/install.sh -o install.sh
 less install.sh
 bash install.sh
 ```
@@ -21,8 +22,11 @@ bash install.sh
 也可以一行安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/herb711/agent-router/main/install.sh | bash
+curl -fL --connect-timeout 15 --max-time 120 --retry 3 \
+  https://cdn.jsdelivr.net/gh/herb711/agent-router@main/install.sh | bash
 ```
+
+如果你使用 `raw.githubusercontent.com` 一直没有输出，通常是网络连不上 GitHub raw 域名；`curl -s` 会隐藏下载进度，所以看起来像卡住。上面的 jsDelivr 地址在国内网络通常更稳定。
 
 如果访问 `nodejs.org` 不稳定，可以先设置镜像：
 
@@ -66,8 +70,9 @@ ccr
 Choose upstream provider:
   1) MiniMax
   2) DeepSeek V4
-  3) Kimi
-  4) vLLM (OpenAI-compatible)
+  3) Zhipu GLM
+  4) Kimi
+  5) Custom OpenAI-compatible / vLLM
 Provider choice [1]:
 ```
 
@@ -75,8 +80,9 @@ Provider choice [1]:
 
 - 用 MiniMax：直接回车，或输入 `1`
 - 用 DeepSeek V4：输入 `2`
-- 用 Kimi：输入 `3`
-- 用自己的 vLLM：输入 `4`
+- 用智谱 GLM：输入 `3`
+- 用 Kimi：输入 `4`
+- 用自己的 vLLM 或其它 OpenAI-compatible 服务：输入 `5`
 
 ### 填写服务地址
 
@@ -91,9 +97,9 @@ Endpoint choice [1]:
 
 在国内使用通常直接回车。需要国际站时输入 `2`。
 
-DeepSeek V4 和 Kimi 使用脚本内置的默认地址，一般不需要手动填写。
+DeepSeek V4、智谱 GLM 和 Kimi 使用脚本内置的默认地址，一般不需要手动填写。
 
-vLLM 会让你填写 OpenAI-compatible base URL：
+Custom OpenAI-compatible / vLLM 会让你填写 OpenAI-compatible base URL：
 
 ```text
 OpenAI-compatible base URL [http://127.0.0.1:8000/v1]:
@@ -115,14 +121,25 @@ http://113.249.108.72:15581
 
 ### 配置 Codex CLI
 
-新版 Codex CLI 使用 OpenAI Responses API 协议。这个安装器面向国内或自建的 OpenAI-compatible 大模型服务，所以 Codex 配置会尽量只问两个信息：`base URL` 和 `API key`。
+新版 Codex CLI 使用 OpenAI Responses API 协议。国内很多 OpenAI-compatible 服务还停在 Chat Completions，所以安装器会先让你选厂家，再自动带出服务地址。
+
+```text
+Choose Codex upstream provider:
+  1) MiniMax
+  2) DeepSeek
+  3) Zhipu GLM
+  4) Kimi / Moonshot
+  5) Custom OpenAI-compatible / vLLM
+Provider choice [1]:
+```
+
+选择 MiniMax、DeepSeek、智谱 GLM、Kimi 时，脚本会使用内置 OpenAI-compatible 地址，不需要再填写 URL。只有选择 `Custom OpenAI-compatible / vLLM` 时，才会询问：
 
 ```text
 OpenAI-compatible base URL [http://127.0.0.1:8000/v1]:
-API Key:
 ```
 
-填完后，脚本会自动访问 `${base URL}/models` 获取可用模型，并把结果做成菜单：
+填写 API key 后，脚本会自动访问 `${base URL}/models` 获取可用模型，并把结果做成菜单：
 
 ```text
 Checking models from http://113.249.108.72:15581/v1/models...
@@ -151,7 +168,7 @@ Model name:
 
 ### 选择模型
 
-MiniMax、DeepSeek V4、Kimi 会显示模型菜单，例如：
+MiniMax、DeepSeek V4、智谱 GLM、Kimi 会显示模型菜单，例如：
 
 ```text
 Primary model:
@@ -223,14 +240,14 @@ Mode [1]:
 
 一般直接回车，使用 `Direct mode`。只有你明确想让 Claude Code 先走本机代理时，才输入 `2`。
 
-vLLM 不会出现这个选择，因为它固定需要本地代理做协议适配。你会看到：
+智谱 GLM 和 Custom OpenAI-compatible / vLLM 不会出现这个选择，因为它们固定需要本地代理做协议适配。你会看到：
 
 ```text
-vLLM uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy.
+Zhipu GLM uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy.
 Local proxy port [8080]:
 ```
 
-这里填的是 Claude Code 连接本机代理的端口，不是 vLLM 服务端口。通常直接回车使用 `8080`。如果 `8080` 已被占用，可以输入其它本机空闲端口，例如：
+智谱 GLM 和 Custom OpenAI-compatible / vLLM 会固定使用本地代理做协议适配。这里填的是 Claude Code 连接本机代理的端口，不是上游服务端口。通常直接回车使用 `8080`。如果 `8080` 已被占用，可以输入其它本机空闲端口，例如：
 
 ```text
 18080
@@ -238,7 +255,7 @@ Local proxy port [8080]:
 
 ### 启动本地代理服务
 
-如果使用 vLLM 或选择了 Local proxy mode，脚本会询问：
+如果使用智谱 GLM、Custom OpenAI-compatible / vLLM，或选择了 Local proxy mode，脚本会询问：
 
 ```text
 Start proxy as a systemd user service now? [Y/n]:
@@ -265,11 +282,12 @@ Claude Code：
 - MiniMax
 - DeepSeek V4
 - Kimi
-- vLLM，OpenAI-compatible API
+- 智谱 GLM，OpenAI-compatible API
+- Custom OpenAI-compatible / vLLM
 
 MiniMax、DeepSeek 和 Kimi 走 Anthropic-compatible API，可以直连，也可以走本地代理。
 
-vLLM 走 OpenAI-compatible `/chat/completions`，而 Claude Code 使用 Anthropic Messages API，所以 vLLM 会固定使用本地 `agent-router-proxy` 做协议适配。
+智谱 GLM 和 Custom OpenAI-compatible / vLLM 走 OpenAI-compatible `/chat/completions`，而 Claude Code 使用 Anthropic Messages API，所以它们会固定使用本地 `agent-router-proxy` 做协议适配。
 
 Codex CLI：
 
@@ -280,8 +298,8 @@ Codex CLI：
 
 vLLM 需要额外注意：
 
-- vLLM 固定使用 Local proxy mode，因为需要把 Claude Code 的 Anthropic Messages API 转成 OpenAI-compatible API。
-- vLLM base URL 留空时默认使用本地地址：
+- 智谱 GLM 和 Custom OpenAI-compatible / vLLM 固定使用 Local proxy mode，因为需要把 Claude Code 的 Anthropic Messages API 转成 OpenAI-compatible API。
+- Custom OpenAI-compatible / vLLM base URL 留空时默认使用本地地址：
 
 ```text
 http://127.0.0.1:8000/v1
