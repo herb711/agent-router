@@ -115,7 +115,7 @@ Endpoint choice [1]:
 
 在国内使用通常直接回车。需要国际站时输入 `2`。
 
-DeepSeek V4、智谱 GLM、Kimi 和小米 MiMo 使用脚本内置的默认地址，一般不需要手动填写。MiMo 的入口页是 `https://mimo.mi.com/`。
+DeepSeek V4、智谱 GLM、Kimi 和小米 MiMo 使用脚本内置的默认地址，一般不需要手动填写。MiMo 的入口页是 `https://mimo.mi.com/`，脚本默认使用专属 base URL `https://token-plan-cn.xiaomimimo.com/v1`。
 
 Custom OpenAI-compatible / vLLM 会让你填写 OpenAI-compatible base URL：
 
@@ -204,6 +204,7 @@ Model choice [1]:
 
 通常直接回车使用推荐模型。要用列表里的其它模型，就输入对应数字。要手动填写模型名，选 `Custom model name` 对应的数字。
 Claude Code 和 Codex CLI 都会记录成功写入过的模型；下次切换时，菜单会把这些历史模型和服务端发现的模型一起展示，方便直接选回以前用过的模型。
+MiMo 的模型 ID 以 `/models` 返回为准，当前可用文本模型使用小写形式，例如 `mimo-v2.5-pro` 和 `mimo-v2.5`。
 
 vLLM 会先尝试读取服务端模型列表：
 
@@ -252,7 +253,7 @@ vLLM API Key:
 
 ### 选择连接模式
 
-MiniMax、DeepSeek V4、Kimi 会让你选择连接方式：
+DeepSeek V4、Kimi 会让你选择连接方式：
 
 ```text
 Choose Claude Code connection mode:
@@ -263,14 +264,14 @@ Mode [1]:
 
 一般直接回车，使用 `Direct mode`。只有你明确想让 Claude Code 先走本机代理时，才输入 `2`。
 
-智谱 GLM、小米 MiMo 和 Custom OpenAI-compatible / vLLM 不会出现这个选择，因为它们固定需要本地代理做协议适配。你会看到：
+MiniMax、智谱 GLM、小米 MiMo 和 Custom OpenAI-compatible / vLLM 不会出现这个选择，因为它们固定需要本地代理做响应规范化或协议适配。你会看到：
 
 ```text
 Zhipu GLM uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy.
 Local proxy port [8080]:
 ```
 
-智谱 GLM、小米 MiMo 和 Custom OpenAI-compatible / vLLM 会固定使用本地代理做协议适配。这里填的是 Claude Code 连接本机代理的端口，不是上游服务端口。通常直接回车使用 `8080`。如果 `8080` 已被占用，可以输入其它本机空闲端口，例如：
+MiniMax、智谱 GLM、小米 MiMo 和 Custom OpenAI-compatible / vLLM 会固定使用本地代理。这里填的是 Claude Code 连接本机代理的端口，不是上游服务端口。通常直接回车使用 `8080`。如果 `8080` 已被占用，可以输入其它本机空闲端口，例如：
 
 ```text
 18080
@@ -278,7 +279,7 @@ Local proxy port [8080]:
 
 ### 启动本地代理服务
 
-如果使用智谱 GLM、小米 MiMo、Custom OpenAI-compatible / vLLM，或选择了 Local proxy mode，脚本会询问：
+如果使用 MiniMax、智谱 GLM、小米 MiMo、Custom OpenAI-compatible / vLLM，或选择了 Local proxy mode，脚本会询问：
 
 ```text
 Start proxy as a systemd user service now? [Y/n]:
@@ -309,7 +310,7 @@ Claude Code：
 - 小米 MiMo，OpenAI-compatible API
 - Custom OpenAI-compatible / vLLM
 
-MiniMax、DeepSeek 和 Kimi 走 Anthropic-compatible API，可以直连，也可以走本地代理。
+DeepSeek 和 Kimi 走 Anthropic-compatible API，可以直连，也可以走本地代理。MiniMax 也走 Anthropic-compatible API，但脚本会固定使用本地代理来过滤上游主动返回的 `thinking` block。
 
 智谱 GLM、小米 MiMo 和 Custom OpenAI-compatible / vLLM 走 OpenAI-compatible `/chat/completions`，而 Claude Code 使用 Anthropic Messages API，所以它们会固定使用本地 `agent-router-proxy` 做协议适配。
 
@@ -322,7 +323,7 @@ Codex CLI：
 
 vLLM 需要额外注意：
 
-- 智谱 GLM、小米 MiMo 和 Custom OpenAI-compatible / vLLM 固定使用 Local proxy mode，因为需要把 Claude Code 的 Anthropic Messages API 转成 OpenAI-compatible API。
+- MiniMax、智谱 GLM、小米 MiMo 和 Custom OpenAI-compatible / vLLM 固定使用 Local proxy mode；MiniMax 用它过滤 `thinking` block，其它 OpenAI-compatible 服务用它做协议适配。
 - Custom OpenAI-compatible / vLLM base URL 留空时默认使用本地地址：
 
 ```text

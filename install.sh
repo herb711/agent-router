@@ -245,7 +245,7 @@ model_note() {
   if [ "$model" = "MiniMax-M2.7" ]; then
     printf '%s' "recommended"
   elif [ "$model" = "MiniMax-M2.7-highspeed" ]; then
-    printf '%s' "recommended high-speed"
+    printf '%s' "high-speed, separate quota"
   elif [ "$model" = "deepseek-v4-pro[1m]" ]; then
     printf '%s' "recommended primary, 1M context"
   elif [ "$model" = "deepseek-v4-flash" ]; then
@@ -1523,6 +1523,173 @@ function pipeOpenAIStreamToAnthropic(proxyRes, res, requestedModel) {
   proxyRes.on('end', finishStream);
 }
 
+function isThinkingBlock(block) {
+  return block && (block.type === 'thinking' || block.type === 'redacted_thinking');
+}
+
+function isThinkingDelta(delta) {
+  return delta && (delta.type === 'thinking_delta' || delta.type === 'signature_delta');
+}
+
+function sanitizeAnthropicMessage(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return payload;
+  }
+  if (payload.message && Array.isArray(payload.message.content)) {
+    payload = { ...payload, message: sanitizeAnthropicMessage(payload.message) };
+  }
+  if (!Array.isArray(payload.content)) {
+    return payload;
+  }
+  const content = payload.content.filter(block => !isThinkingBlock(block));
+  return {
+    ...payload,
+    content: content.length > 0 ? content : [{ type: 'text', text: '' }]
+  };
+}
+
+function writeAnthropicSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function parseSseEvent(eventText) {
+  let event = 'message';
+  const dataLines = [];
+  for (const line of eventText.split(/\r?\n/)) {
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+  return { event, data: dataLines.join('\n') };
+}
+
+function pipeAnthropicStream(proxyRes, res) {
+  res.writeHead(proxyRes.statusCode || 200, {
+    ...proxyRes.headers,
+    'content-type': 'text/event-stream; charset=utf-8',
+    'x-proxied-by': 'agent-router-proxy-server'
+  });
+
+  const droppedIndexes = new Set();
+  const indexMap = new Map();
+  let nextIndex = 0;
+  let sentContentBlock = false;
+
+  function mappedIndex(index) {
+    if (droppedIndexes.has(index)) {
+      return null;
+    }
+    if (!indexMap.has(index)) {
+      indexMap.set(index, nextIndex++);
+    }
+    return indexMap.get(index);
+  }
+
+  function ensureEmptyContentBlock() {
+    if (sentContentBlock) {
+      return;
+    }
+    const index = nextIndex++;
+    sentContentBlock = true;
+    writeAnthropicSse(res, 'content_block_start', {
+      type: 'content_block_start',
+      index,
+      content_block: { type: 'text', text: '' }
+    });
+    writeAnthropicSse(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index,
+      delta: { type: 'text_delta', text: '' }
+    });
+    writeAnthropicSse(res, 'content_block_stop', {
+      type: 'content_block_stop',
+      index
+    });
+  }
+
+  let buffer = '';
+  proxyRes.on('data', chunk => {
+    buffer += chunk.toString('utf8');
+    const events = buffer.split(/\r?\n\r?\n/);
+    buffer = events.pop() || '';
+
+    for (const eventText of events) {
+      const { event, data } = parseSseEvent(eventText);
+      if (!data) {
+        continue;
+      }
+      if (data.trim() === '[DONE]') {
+        res.write(`data: [DONE]\n\n`);
+        continue;
+      }
+
+      try {
+        const payload = sanitizeAnthropicMessage(JSON.parse(data));
+        if (event === 'content_block_start') {
+          if (isThinkingBlock(payload.content_block)) {
+            droppedIndexes.add(payload.index);
+            continue;
+          }
+          payload.index = mappedIndex(payload.index);
+          sentContentBlock = true;
+        } else if (event === 'content_block_delta') {
+          if (droppedIndexes.has(payload.index) || isThinkingDelta(payload.delta)) {
+            continue;
+          }
+          payload.index = mappedIndex(payload.index);
+          if (payload.index == null) {
+            continue;
+          }
+        } else if (event === 'content_block_stop') {
+          if (droppedIndexes.has(payload.index)) {
+            continue;
+          }
+          payload.index = mappedIndex(payload.index);
+          if (payload.index == null) {
+            continue;
+          }
+        } else if (event === 'message_delta' || event === 'message_stop') {
+          ensureEmptyContentBlock();
+        }
+        writeAnthropicSse(res, event, payload);
+      } catch {
+        res.write(`${eventText}\n\n`);
+      }
+    }
+  });
+  proxyRes.on('end', () => res.end());
+}
+
+function pipeAnthropicResponse(proxyRes, res) {
+  if ((proxyRes.statusCode || 500) >= 400) {
+    res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+    proxyRes.pipe(res);
+    return;
+  }
+
+  const contentType = String(proxyRes.headers['content-type'] || '').toLowerCase();
+  if (contentType.includes('text/event-stream')) {
+    pipeAnthropicStream(proxyRes, res);
+    return;
+  }
+
+  const responseChunks = [];
+  proxyRes.on('data', chunk => responseChunks.push(chunk));
+  proxyRes.on('end', () => {
+    const rawResponse = Buffer.concat(responseChunks);
+    try {
+      const payload = sanitizeAnthropicMessage(JSON.parse(rawResponse.toString('utf8')));
+      sendJson(res, proxyRes.statusCode || 200, payload);
+    } catch {
+      res.writeHead(proxyRes.statusCode || 200, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+      res.end(rawResponse);
+    }
+  });
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     sendJson(res, 200, { status: 'ok', provider, api_format: normalizedApiFormat });
@@ -1692,9 +1859,7 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      const headers = { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' };
-      res.writeHead(proxyRes.statusCode || 502, headers);
-      proxyRes.pipe(res);
+      pipeAnthropicResponse(proxyRes, res);
     });
 
     proxyReq.on('error', err => {
@@ -2209,7 +2374,7 @@ configure_codex_provider() {
     5)
       provider="mimo"
       provider_label="Xiaomi MiMo"
-      base_url="https://api.xiaomimimo.com/v1"
+      base_url="https://token-plan-cn.xiaomimimo.com/v1"
       [ "$current_provider" = "$provider" ] || default_model="mimo-v2.5-pro"
       say "Xiaomi MiMo website: https://mimo.mi.com/"
       say "Xiaomi MiMo OpenAI-compatible endpoint: ${base_url}"
@@ -2483,7 +2648,7 @@ model_note() {
   if [ "$model" = "MiniMax-M2.7" ]; then
     printf '%s' "recommended"
   elif [ "$model" = "MiniMax-M2.7-highspeed" ]; then
-    printf '%s' "recommended high-speed"
+    printf '%s' "high-speed, separate quota"
   elif [ "$model" = "deepseek-v4-pro[1m]" ]; then
     printf '%s' "recommended primary, 1M context"
   elif [ "$model" = "deepseek-v4-flash" ]; then
@@ -3732,6 +3897,173 @@ function pipeOpenAIStreamToAnthropic(proxyRes, res, requestedModel) {
   proxyRes.on('end', finishStream);
 }
 
+function isThinkingBlock(block) {
+  return block && (block.type === 'thinking' || block.type === 'redacted_thinking');
+}
+
+function isThinkingDelta(delta) {
+  return delta && (delta.type === 'thinking_delta' || delta.type === 'signature_delta');
+}
+
+function sanitizeAnthropicMessage(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return payload;
+  }
+  if (payload.message && Array.isArray(payload.message.content)) {
+    payload = { ...payload, message: sanitizeAnthropicMessage(payload.message) };
+  }
+  if (!Array.isArray(payload.content)) {
+    return payload;
+  }
+  const content = payload.content.filter(block => !isThinkingBlock(block));
+  return {
+    ...payload,
+    content: content.length > 0 ? content : [{ type: 'text', text: '' }]
+  };
+}
+
+function writeAnthropicSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function parseSseEvent(eventText) {
+  let event = 'message';
+  const dataLines = [];
+  for (const line of eventText.split(/\r?\n/)) {
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+  return { event, data: dataLines.join('\n') };
+}
+
+function pipeAnthropicStream(proxyRes, res) {
+  res.writeHead(proxyRes.statusCode || 200, {
+    ...proxyRes.headers,
+    'content-type': 'text/event-stream; charset=utf-8',
+    'x-proxied-by': 'agent-router-proxy-server'
+  });
+
+  const droppedIndexes = new Set();
+  const indexMap = new Map();
+  let nextIndex = 0;
+  let sentContentBlock = false;
+
+  function mappedIndex(index) {
+    if (droppedIndexes.has(index)) {
+      return null;
+    }
+    if (!indexMap.has(index)) {
+      indexMap.set(index, nextIndex++);
+    }
+    return indexMap.get(index);
+  }
+
+  function ensureEmptyContentBlock() {
+    if (sentContentBlock) {
+      return;
+    }
+    const index = nextIndex++;
+    sentContentBlock = true;
+    writeAnthropicSse(res, 'content_block_start', {
+      type: 'content_block_start',
+      index,
+      content_block: { type: 'text', text: '' }
+    });
+    writeAnthropicSse(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index,
+      delta: { type: 'text_delta', text: '' }
+    });
+    writeAnthropicSse(res, 'content_block_stop', {
+      type: 'content_block_stop',
+      index
+    });
+  }
+
+  let buffer = '';
+  proxyRes.on('data', chunk => {
+    buffer += chunk.toString('utf8');
+    const events = buffer.split(/\r?\n\r?\n/);
+    buffer = events.pop() || '';
+
+    for (const eventText of events) {
+      const { event, data } = parseSseEvent(eventText);
+      if (!data) {
+        continue;
+      }
+      if (data.trim() === '[DONE]') {
+        res.write(`data: [DONE]\n\n`);
+        continue;
+      }
+
+      try {
+        const payload = sanitizeAnthropicMessage(JSON.parse(data));
+        if (event === 'content_block_start') {
+          if (isThinkingBlock(payload.content_block)) {
+            droppedIndexes.add(payload.index);
+            continue;
+          }
+          payload.index = mappedIndex(payload.index);
+          sentContentBlock = true;
+        } else if (event === 'content_block_delta') {
+          if (droppedIndexes.has(payload.index) || isThinkingDelta(payload.delta)) {
+            continue;
+          }
+          payload.index = mappedIndex(payload.index);
+          if (payload.index == null) {
+            continue;
+          }
+        } else if (event === 'content_block_stop') {
+          if (droppedIndexes.has(payload.index)) {
+            continue;
+          }
+          payload.index = mappedIndex(payload.index);
+          if (payload.index == null) {
+            continue;
+          }
+        } else if (event === 'message_delta' || event === 'message_stop') {
+          ensureEmptyContentBlock();
+        }
+        writeAnthropicSse(res, event, payload);
+      } catch {
+        res.write(`${eventText}\n\n`);
+      }
+    }
+  });
+  proxyRes.on('end', () => res.end());
+}
+
+function pipeAnthropicResponse(proxyRes, res) {
+  if ((proxyRes.statusCode || 500) >= 400) {
+    res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+    proxyRes.pipe(res);
+    return;
+  }
+
+  const contentType = String(proxyRes.headers['content-type'] || '').toLowerCase();
+  if (contentType.includes('text/event-stream')) {
+    pipeAnthropicStream(proxyRes, res);
+    return;
+  }
+
+  const responseChunks = [];
+  proxyRes.on('data', chunk => responseChunks.push(chunk));
+  proxyRes.on('end', () => {
+    const rawResponse = Buffer.concat(responseChunks);
+    try {
+      const payload = sanitizeAnthropicMessage(JSON.parse(rawResponse.toString('utf8')));
+      sendJson(res, proxyRes.statusCode || 200, payload);
+    } catch {
+      res.writeHead(proxyRes.statusCode || 200, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+      res.end(rawResponse);
+    }
+  });
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     sendJson(res, 200, { status: 'ok', provider, api_format: normalizedApiFormat });
@@ -3901,9 +4233,7 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      const headers = { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' };
-      res.writeHead(proxyRes.statusCode || 502, headers);
-      proxyRes.pipe(res);
+      pipeAnthropicResponse(proxyRes, res);
     });
 
     proxyReq.on('error', err => {
@@ -4045,7 +4375,7 @@ main() {
       default_model="mimo-v2.5-pro"
       default_small_model="$default_model"
       api_format="openai-chat"
-      base_url="https://api.xiaomimimo.com/v1"
+      base_url="https://token-plan-cn.xiaomimimo.com/v1"
       say "Xiaomi MiMo website: https://mimo.mi.com/"
       say "Xiaomi MiMo OpenAI-compatible endpoint: ${base_url}"
       ;;
@@ -4136,9 +4466,13 @@ main() {
   local large_model="$model"
   local subagent_model="$small_model"
 
-  if [ "$api_format" = "openai-chat" ]; then
+  if [ "$api_format" = "openai-chat" ] || [ "$provider" = "minimax" ]; then
     say
-    say "${provider_label} uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy."
+    if [ "$api_format" = "openai-chat" ]; then
+      say "${provider_label} uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy."
+    else
+      say "${provider_label} will use the local proxy to normalize Anthropic-compatible responses."
+    fi
     local port
     port="$(prompt_default 'Local proxy port' "$(current_proxy_port)")"
     write_proxy_files "$provider" "$base_url" "$api_key" "$port" "$auth_header" "$api_format"
@@ -5013,7 +5347,7 @@ main() {
     5)
       provider="mimo"
       provider_label="Xiaomi MiMo"
-      base_url="https://api.xiaomimimo.com/v1"
+      base_url="https://token-plan-cn.xiaomimimo.com/v1"
       [ "$current_provider" = "$provider" ] || default_model="mimo-v2.5-pro"
       say "Xiaomi MiMo website: https://mimo.mi.com/"
       say "Xiaomi MiMo OpenAI-compatible endpoint: ${base_url}"
@@ -5164,7 +5498,7 @@ run_claude_setup() {
       default_model="mimo-v2.5-pro"
       default_small_model="$default_model"
       api_format="openai-chat"
-      base_url="https://api.xiaomimimo.com/v1"
+      base_url="https://token-plan-cn.xiaomimimo.com/v1"
       say "Xiaomi MiMo website: https://mimo.mi.com/"
       say "Xiaomi MiMo OpenAI-compatible endpoint: ${base_url}"
       ;;
@@ -5225,9 +5559,13 @@ run_claude_setup() {
   local large_model="$model"
   local subagent_model="$small_model"
 
-  if [ "$api_format" = "openai-chat" ]; then
+  if [ "$api_format" = "openai-chat" ] || [ "$provider" = "minimax" ]; then
     say
-    say "${provider_label} uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy."
+    if [ "$api_format" = "openai-chat" ]; then
+      say "${provider_label} uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy."
+    else
+      say "${provider_label} will use the local proxy to normalize Anthropic-compatible responses."
+    fi
     local port
     port="$(prompt_default 'Local proxy port' '8080')"
     write_proxy_files "$provider" "$base_url" "$api_key" "$port" "$auth_header" "$api_format"
